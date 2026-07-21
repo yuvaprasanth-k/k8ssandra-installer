@@ -1,0 +1,33 @@
+# Secrets — never commit
+*.env
+.env.*
+secrets/
+*-credentials*
+aws-credentials
+medusa-bucket-key*
+
+# Kubernetes generated files
+kubeconfig
+admin.conf
+*.kubeconfig
+
+# Helm
+charts/
+*.tgz
+
+# Temp files created by scripts
+kube-prom-stack-values-local.yaml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Logs
+*.log
+kubeadm-init.log
