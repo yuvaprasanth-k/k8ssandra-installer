@@ -11,6 +11,9 @@
 #     sudo bash k8s-k8ssandra-setup.sh --role worker \
 #       --join-command "kubeadm join <ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
 #
+#   K8ssandra only (on an existing cluster):
+#     sudo bash k8s-k8ssandra-setup.sh --role k8ssandra
+#
 # Requirements:
 #   - Amazon Linux 2 or Ubuntu 20.04/22.04
 #   - Run as root or with sudo
@@ -52,8 +55,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$ROLE" ]] && error "Missing --role. Use: --role control-plane  OR  --role worker"
-[[ "$ROLE" != "control-plane" && "$ROLE" != "worker" ]] && \
-  error "--role must be 'control-plane' or 'worker'"
+[[ "$ROLE" != "control-plane" && "$ROLE" != "worker" && "$ROLE" != "k8ssandra" ]] && \
+  error "--role must be 'control-plane', 'worker', or 'k8ssandra'"
 [[ "$ROLE" == "worker" && -z "$JOIN_COMMAND" ]] && \
   error "Worker nodes require --join-command. Get it from the control plane output."
 
@@ -363,11 +366,11 @@ data:
   setup: |-
     #!/bin/sh
     set -eu
-    mkdir -m 0777 -p "$VOL_DIR"
+    mkdir -m 0777 -p "\$VOL_DIR"
   teardown: |-
     #!/bin/sh
     set -eu
-    rm -rf "$VOL_DIR"
+    rm -rf "\$VOL_DIR"
   helperPod.yaml: |-
     apiVersion: v1
     kind: Pod
@@ -380,9 +383,17 @@ data:
           imagePullPolicy: IfNotPresent
 EOF
 
-  info "Waiting for local-path-provisioner to be ready..."
+  # ── Remove control-plane taint if no workers have joined yet ──
+  WORKER_COUNT=$(kubectl get nodes --no-headers \
+    --selector='!node-role.kubernetes.io/control-plane' 2>/dev/null | wc -l)
+  if [[ "$WORKER_COUNT" -eq 0 ]]; then
+    warn "No worker nodes found — removing control-plane taint so pods can schedule."
+    kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
+  fi
+
+  info "Waiting for local-path-provisioner to be ready (up to 2 min)..."
   kubectl rollout status deployment/local-path-provisioner \
-    -n local-path-storage --timeout=60s
+    -n local-path-storage --timeout=120s
   success "local-path-provisioner is ready."
 
   # ── Ensure /opt/local-path-provisioner exists on all nodes ──
@@ -418,7 +429,7 @@ EOF
 
   # ── Deploy Cassandra Cluster with local-path storage ──
   info "Deploying Cassandra cluster (${CASSANDRA_DC_SIZE} nodes, Cassandra ${CASSANDRA_SERVER_VERSION})..."
-  kubectl apply -f - <<EOF
+  kubectl apply -f - <<EOF_CLUSTER
 apiVersion: k8ssandra.io/v1alpha1
 kind: K8ssandraCluster
 metadata:
@@ -442,7 +453,7 @@ spec:
         config:
           jvmOptions:
             heapSize: 2048M
-EOF
+EOF_CLUSTER
   success "Cassandra cluster manifest applied."
 
   # ── Final verification ──
@@ -482,11 +493,13 @@ echo -e "${CYAN} Role: ${ROLE} | Host: $(hostname)${NC}"
 echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
 echo ""
 
-phase1_common
-
 if [[ "$ROLE" == "control-plane" ]]; then
+  phase1_common
   phase2_control_plane
   phase3_k8ssandra
 elif [[ "$ROLE" == "worker" ]]; then
+  phase1_common
   phase2_worker
+elif [[ "$ROLE" == "k8ssandra" ]]; then
+  phase3_k8ssandra
 fi

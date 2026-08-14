@@ -28,6 +28,8 @@ k8ssandra-on-ec2/
 ├── scripts/
 │   ├── k8s-k8ssandra-setup.sh       # Main installer (Kubernetes + K8ssandra)
 │   ├── k8ssandra-addons-setup.sh    # Addons installer (Monitoring, Reaper, Medusa)
+│   ├── k8ssandra-add-dc.sh          # Add a new Cassandra datacenter to existing cluster
+│   ├── k8ssandra-cleanup.sh         # Cleanup — K8ssandra only or full cluster teardown
 │   └── fix-pvc-ebs.sh               # Optional: EBS CSI driver (production storage)
 ├── manifests/
 │   ├── local-path-provisioner.yaml  # Local storage provisioner
@@ -88,6 +90,70 @@ sudo bash scripts/k8ssandra-addons-setup.sh --reaper
 
 ---
 
+## Adding a Datacenter
+
+Add a new Cassandra datacenter (dc2, dc3, …) to an existing cluster. Run on the **control plane node**.
+
+Each new DC gets its own dedicated PVCs — data is not shared with existing DCs.
+
+```bash
+# Add dc2 with defaults (3 nodes, 20Gi storage per node)
+sudo bash scripts/k8ssandra-add-dc.sh --dc-name dc2
+
+# Add dc3 with custom size and storage
+sudo bash scripts/k8ssandra-add-dc.sh --dc-name dc3 --dc-size 3 --storage 20Gi
+```
+
+> **Note:** Each DC requires its own set of worker nodes due to Cassandra's pod anti-affinity rules. A 3-node DC needs 3 worker nodes that don't already have a Cassandra pod scheduled on them. Make sure to join additional worker nodes before adding a DC:
+> ```bash
+> sudo bash scripts/k8s-k8ssandra-setup.sh --role worker \
+>   --join-command "kubeadm join <ip>:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
+> ```
+
+Monitor the new DC coming up:
+```bash
+kubectl get k8ssandracluster cassandra-cluster -n k8ssandra-operator -w
+kubectl get pods -n k8ssandra-operator -l cassandra.datastax.com/datacenter=dc2 -w
+kubectl get pvc -n k8ssandra-operator -w
+```
+
+---
+
+## Cleanup
+
+### Remove K8ssandra only (keep Kubernetes running)
+
+Removes the entire K8ssandra stack and all addons (Prometheus, Grafana, Reaper, Medusa, cert-manager, local-path-provisioner). Kubernetes and the worker nodes stay up.
+
+```bash
+sudo bash scripts/k8ssandra-cleanup.sh --scope k8ssandra
+```
+
+### Full teardown (all nodes)
+
+Removes everything — K8ssandra stack, then resets all worker nodes automatically over SSH, then resets the control plane. Each node is left in a clean state.
+
+```bash
+# Default SSH user (ec2-user) and key (~/.ssh/id_rsa)
+sudo bash scripts/k8ssandra-cleanup.sh --scope full
+
+# Custom SSH user / key
+sudo bash scripts/k8ssandra-cleanup.sh --scope full \
+  --ssh-user ubuntu \
+  --ssh-key /root/.ssh/my-key.pem
+```
+
+The full teardown sequence is fully automated — no manual steps on worker nodes required:
+
+| Step | Action |
+|------|--------|
+| 1 | Remove K8ssandra + all addons from the cluster |
+| 2 | Discover all worker node IPs via `kubectl` |
+| 3 | Drain each worker, SSH in, run `kubeadm reset`, remove packages and data |
+| 4 | Reset the control plane node |
+
+---
+
 ## Accessing Services
 
 | Service | URL | Credentials |
@@ -123,6 +189,16 @@ kubectl get secret cassandra-cluster-reaper-ui -n k8ssandra-operator \
 | `9042` | TCP | Cassandra CQL |
 | `7000-7001` | TCP | Cassandra inter-node |
 | `30000-32767` | TCP | Kubernetes NodePort range |
+
+---
+
+## Install K8ssandra on an Existing Cluster
+
+If Kubernetes is already set up and you only need to install K8ssandra (skipping Phase 1 and 2):
+
+```bash
+sudo bash scripts/k8s-k8ssandra-setup.sh --role k8ssandra
+```
 
 ---
 

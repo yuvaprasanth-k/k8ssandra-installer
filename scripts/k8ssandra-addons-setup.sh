@@ -4,6 +4,13 @@
 # Deploys: Monitoring (Prometheus + Grafana), Management API,
 #          Reaper (repairs), Medusa (backup/restore) for K8ssandra
 #
+# Addon coverage across datacenters:
+#   - Prometheus + Grafana : cluster-wide — covers ALL DCs automatically
+#   - Telemetry patch      : cluster-wide — covers ALL DCs automatically
+#   - Reaper               : operator deploys one Reaper service per DC —
+#                            this script patches NodePort for ALL DCs
+#   - Medusa               : cluster-wide — covers ALL DCs automatically
+#
 # Usage:
 #   sudo bash k8ssandra-addons-setup.sh [OPTIONS]
 #
@@ -238,14 +245,17 @@ patch_k8ssandra_cluster() {
 }
 
 # ════════════════════════════════════════════════════════════════
-# COMPONENT 3 — REAPER (service patched to NodePort)
+# COMPONENT 3 — REAPER (NodePort patched for every DC)
+# The K8ssandra operator creates one Reaper service per DC.
+# This function discovers all DC services and patches them all.
+# NodePorts are assigned starting at 32080, incrementing by 10
+# per DC: dc1=32080, dc2=32090, dc3=32100, …
 # ════════════════════════════════════════════════════════════════
 setup_reaper() {
-  header "COMPONENT 3: Reaper — Cassandra Repair Scheduler"
+  header "COMPONENT 3: Reaper — Cassandra Repair Scheduler (all DCs)"
 
-  # ── Wait for Reaper pod to be Running ──
-  info "Waiting for Reaper pod to be Running (up to 3 min)..."
-  REAPER_POD=""
+  # ── Wait for at least one Reaper pod to be Running ──
+  info "Waiting for Reaper pod(s) to be Running (up to 3 min)..."
   for i in {1..18}; do
     REAPER_POD=$(kubectl get pods -n "$NAMESPACE" \
       --selector=app.kubernetes.io/component=reaper \
@@ -257,68 +267,79 @@ setup_reaper() {
     fi
     sleep 10
   done
+  [[ -z "$REAPER_POD" ]] && \
+    warn "Reaper pod not found yet — services will still be patched if present."
 
-  if [[ -z "$REAPER_POD" ]]; then
-    warn "Reaper pod not found yet — it may still be starting."
-    warn "Re-run once the pod is Running: kubectl get pods -n ${NAMESPACE} -l app.kubernetes.io/component=reaper"
-  fi
-
-  # ── Patch Reaper service from ClusterIP → NodePort ──
-  REAPER_SVC="${CLUSTER_NAME}-dc1-reaper-service"
-  info "Patching Reaper service '${REAPER_SVC}' to NodePort (8080 → 32080, 8081 → 32081)..."
-
-  # Wait up to 2 min for the service to be created by the operator
-  for i in {1..12}; do
-    kubectl get svc "$REAPER_SVC" -n "$NAMESPACE" &>/dev/null && break
-    info "Waiting for service ${REAPER_SVC} to be created..."
-    sleep 10
-  done
-
-  # Patch type + pin both NodePorts; fall back to simple merge patch if JSON patch fails
-  kubectl patch svc "$REAPER_SVC" \
-    -n "$NAMESPACE" \
-    --type=json \
-    -p='[
-      {"op": "replace", "path": "/spec/type",                    "value": "NodePort"},
-      {"op": "replace", "path": "/spec/ports/0/nodePort",        "value": 32080},
-      {"op": "replace", "path": "/spec/ports/1/nodePort",        "value": 32081}
-    ]' 2>/dev/null || \
-  kubectl patch svc "$REAPER_SVC" \
-    -n "$NAMESPACE" \
-    --type=merge \
-    -p '{"spec": {"type": "NodePort"}}' || \
-    warn "Could not auto-patch service. Run manually: kubectl patch svc ${REAPER_SVC} -n ${NAMESPACE} --type=merge -p '{\"spec\":{\"type\":\"NodePort\"}}'"
-
-  success "Reaper service patched to NodePort."
-
-  # ── Retrieve the assigned NodePort ──
-  REAPER_NODEPORT=$(kubectl get svc "$REAPER_SVC" -n "$NAMESPACE" \
-    -o jsonpath='{.spec.ports[?(@.port==8080)].nodePort}' 2>/dev/null || echo "32080")
-
-  # ── Get a worker node IP (prefer ExternalIP, fall back to InternalIP) ──
+  # ── Get a node IP for access info ──
   NODE_IP=$(kubectl get nodes \
     -o jsonpath='{.items[1].status.addresses[?(@.type=="ExternalIP")].address}' 2>/dev/null || echo "")
-  if [[ -z "$NODE_IP" ]]; then
-    NODE_IP=$(kubectl get nodes \
-      -o jsonpath='{.items[1].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "<node-ip>")
-  fi
+  [[ -z "$NODE_IP" ]] && NODE_IP=$(kubectl get nodes \
+    -o jsonpath='{.items[1].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "<node-ip>")
 
-  # ── Get Reaper credentials ──
+  # ── Get Reaper credentials (shared across all DCs) ──
   REAPER_SECRET="${CLUSTER_NAME}-reaper-ui"
   REAPER_PASS=$(kubectl get secret "$REAPER_SECRET" -n "$NAMESPACE" \
     -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "check-secret-manually")
 
+  # ── Discover all DC names from the K8ssandraCluster CR ──
+  mapfile -t DC_NAMES < <(kubectl get k8ssandracluster "$CLUSTER_NAME" \
+    -n "$NAMESPACE" \
+    -o jsonpath='{range .spec.cassandra.datacenters[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "dc1")
+
+  info "Found ${#DC_NAMES[@]} datacenter(s): ${DC_NAMES[*]}"
+
+  # ── Patch Reaper service for each DC ──
+  BASE_NODEPORT=32080
+  DC_INDEX=0
+  for DC in "${DC_NAMES[@]}"; do
+    REAPER_SVC="${CLUSTER_NAME}-${DC}-reaper-service"
+    NODEPORT=$((BASE_NODEPORT + DC_INDEX * 10))
+    NODEPORT_ADMIN=$((NODEPORT + 1))
+
+    info "Patching Reaper service for ${DC}: '${REAPER_SVC}' → NodePort ${NODEPORT}..."
+
+    # Wait up to 2 min for the service to exist
+    SVC_FOUND=false
+    for i in {1..12}; do
+      if kubectl get svc "$REAPER_SVC" -n "$NAMESPACE" &>/dev/null; then
+        SVC_FOUND=true
+        break
+      fi
+      info "  Waiting for ${REAPER_SVC} to be created..."
+      sleep 10
+    done
+
+    if [[ "$SVC_FOUND" == "false" ]]; then
+      warn "Service '${REAPER_SVC}' not found — skipping (DC may still be starting)."
+      DC_INDEX=$((DC_INDEX + 1))
+      continue
+    fi
+
+    # Patch type + NodePorts; fall back to simple merge patch
+    kubectl patch svc "$REAPER_SVC" \
+      -n "$NAMESPACE" \
+      --type=json \
+      -p="[
+        {\"op\": \"replace\", \"path\": \"/spec/type\",             \"value\": \"NodePort\"},
+        {\"op\": \"replace\", \"path\": \"/spec/ports/0/nodePort\", \"value\": ${NODEPORT}},
+        {\"op\": \"replace\", \"path\": \"/spec/ports/1/nodePort\", \"value\": ${NODEPORT_ADMIN}}
+      ]" 2>/dev/null || \
+    kubectl patch svc "$REAPER_SVC" \
+      -n "$NAMESPACE" \
+      --type=merge \
+      -p '{"spec": {"type": "NodePort"}}' || \
+      warn "Could not patch ${REAPER_SVC} — patch manually: kubectl patch svc ${REAPER_SVC} -n ${NAMESPACE} --type=merge -p '{\"spec\":{\"type\":\"NodePort\"}}'"
+
+    success "Reaper service for ${DC} patched to NodePort ${NODEPORT}."
+    echo -e "${YELLOW}  ${DC} Web UI :${NC} http://${NODE_IP}:${NODEPORT}/webui"
+
+    DC_INDEX=$((DC_INDEX + 1))
+  done
+
   echo ""
-  success "Reaper is accessible via NodePort!"
-  echo -e "${YELLOW}  Web UI (NodePort) :${NC} http://${NODE_IP}:${REAPER_NODEPORT}/webui"
-  echo -e "${YELLOW}  Username          :${NC} ${CLUSTER_NAME}-reaper-ui"
-  echo -e "${YELLOW}  Password          :${NC} ${REAPER_PASS}"
-  echo ""
-  echo -e "${YELLOW}  Get password      :${NC} kubectl get secret ${REAPER_SECRET} -n ${NAMESPACE} -o jsonpath='{.data.password}' | base64 -d"
-  echo -e "${YELLOW}  Service status    :${NC} kubectl get svc ${REAPER_SVC} -n ${NAMESPACE}"
-  echo ""
-  echo -e "${YELLOW}  ▶ To patch manually if needed:${NC}"
-  echo -e "    kubectl patch svc ${REAPER_SVC} -n ${NAMESPACE} --type=merge -p '{\"spec\":{\"type\":\"NodePort\"}}'"
+  echo -e "${YELLOW}  Username   :${NC} ${CLUSTER_NAME}-reaper-ui"
+  echo -e "${YELLOW}  Password   :${NC} ${REAPER_PASS}"
+  echo -e "${YELLOW}  Get secret :${NC} kubectl get secret ${REAPER_SECRET} -n ${NAMESPACE} -o jsonpath='{.data.password}' | base64 -d"
   echo ""
 }
 
