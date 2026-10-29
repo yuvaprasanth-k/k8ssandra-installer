@@ -316,9 +316,3 @@ kubectl exec -it cassandra-cluster-dc1-default-sts-0 -n k8ssandra-operator -c ca
 
 
 For in-depth operational procedures, consult [`docs/k8ssandra-runbook.md`](docs/k8ssandra-runbook.md).
-
----
-
-## License
-
-Apache License 2.0
