@@ -10,7 +10,7 @@ This repository provides single-command automation for:
 - Provisioning a multi-node **Kubernetes (kubeadm)** cluster across EC2 instances or Linux VMs.
 - Setting up CNI networking (**Calico** VXLAN overlay), dynamic local storage (**local-path-provisioner**) or AWS EBS gp3, and **cert-manager**.
 - Deploying the **K8ssandra Operator** and orchestrating an **Apache Cassandra** (4.1.x / 5.0.x) cluster with anti-affinity across nodes or availability zones.
-- Optional Day-2 addons: **Prometheus & Grafana** metrics dashboards, **Reaper** automated repairs, and **Medusa** backup/restore (using AWS S3, S3-compatible storage, or in-cluster **SeaweedFS**).
+- Optional addons: **Prometheus & Grafana** metrics dashboards, **Reaper** automated repairs, and **Medusa** backup/restore (using AWS S3, S3-compatible storage, or in-cluster **SeaweedFS**).
 
 ---
 
@@ -47,7 +47,7 @@ k8ssandra-installer/
 │   ├── cluster.env.example          # Environment configuration template
 │   └── kube-prom-stack-values.yaml  # Prometheus and Grafana Helm values
 └── docs/
-    ├── k8ssandra-runbook.md         # Operational and Day-2 administration runbook
+    ├── k8ssandra-runbook.md         # Operational administration runbook
     └── k8ssandra-on-ec2.txt         # Architecture, prerequisites, and backup notes
 ```
 
@@ -140,7 +140,7 @@ bash scripts/k8s-k8ssandra-setup.sh --role k8ssandra \
 
 ---
 
-## Day-2 Operations
+## Cluster Operations
 
 ### 1. Accessing Services
 
