@@ -57,7 +57,7 @@ k8ssandra-installer/
 
 1. **Instances / Virtual Machines**:
    - **Control Plane**: 1 node (minimum 2 vCPU, 4 GB RAM, 30 GB disk — e.g., `t3.medium`).
-   - **Worker Nodes**: 1 node per Cassandra replica (`DC_SIZE`, default 3 nodes, minimum `t3.large`, recommended `m5.xlarge`+ for production, 50 GB+ disk).
+   - **Worker Nodes**: 1 node per Cassandra replica (`DC_SIZE`, default 3 nodes, e.g., `t3.large`).
    - **Operating System**: Ubuntu 24.04 LTS (recommended), Ubuntu 22.04 LTS, Amazon Linux 2023, or RHEL-compatible.
 2. **Network & Connectivity**:
    - All nodes must reside in the same VPC/subnet with private IPs reachable from each other.
@@ -70,10 +70,17 @@ k8ssandra-installer/
 
 ## Quick Start (One-Command Deployment)
 
-### Step 1: Copy or Clone Repository to Control-Plane Node
-Copy this repository onto your designated control-plane node.
+### Step 1: Launch Cluster with ctool
+Launch a 4-node cluster (1 control plane + 3 workers) on Ubuntu 24.04 (noble):
 
-### Step 2: Configure Environment Settings
+```bash
+ctool launch $cluster -p noble -i t3.large 4
+```
+
+### Step 2: Copy or Clone Repository to Control-Plane Node
+Copy this repository onto your designated control-plane node (Node 1).
+
+### Step 3: Configure Environment Settings
 Copy the template and edit your worker private IPs and SSH credentials:
 
 ```bash
@@ -84,11 +91,11 @@ vi config/cluster.env
 At minimum, set:
 ```ini
 WORKERS="10.0.1.11,10.0.1.12,10.0.1.13"
-SSH_USER=ec2-user
-SSH_KEY=/home/ec2-user/.ssh/cluster-key.pem
+SSH_USER=ubuntu
+SSH_KEY=/home/ubuntu/.ssh/cluster-key.pem
 ```
 
-### Step 3: Run the Automated Installer
+### Step 4: Run the Automated Installer
 Execute the setup script from the control-plane node:
 
 ```bash
