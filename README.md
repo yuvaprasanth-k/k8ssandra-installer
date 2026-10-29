@@ -95,13 +95,14 @@ Execute the setup script from the control-plane node:
 sudo bash scripts/k8s-k8ssandra-setup.sh --role all --config config/cluster.env
 ```
 
-*Or pass configuration directly via CLI flags:*
+*Or pass configuration directly via CLI flags (including optional addons):*
 ```bash
 sudo bash scripts/k8s-k8ssandra-setup.sh --role all \
   --workers 10.0.1.11,10.0.1.12,10.0.1.13 \
   --ssh-user ec2-user \
   --ssh-key /home/ec2-user/.ssh/cluster-key.pem \
-  --dc-size 3
+  --dc-size 3 \
+  --addons monitoring,reaper
 ```
 
 ---
@@ -140,51 +141,94 @@ bash scripts/k8s-k8ssandra-setup.sh --role k8ssandra \
 
 ---
 
-## Cluster Operations
+## Optional Addons: Monitoring, Reaper, and Backup
 
-### 1. Accessing Services
+You can deploy addons either during the initial cluster installation via `--addons monitoring,reaper,medusa` or at any time using the standalone addon scripts.
 
-- **Cassandra CQL**:
+### 1. Monitoring & Reaper (`scripts/k8ssandra-addons-setup.sh`)
+
+This script installs Prometheus, Grafana with pre-built Cassandra dashboards, and Apache Cassandra Reaper for automated repair scheduling.
+
+#### Install Monitoring (Prometheus + Grafana)
+Deploys `kube-prometheus-stack`, configures Cassandra metrics telemetry, and provisions Grafana dashboards:
+
+```bash
+sudo bash scripts/k8ssandra-addons-setup.sh --monitoring
+```
+
+- **Access Grafana**: `http://<node-ip>:32000`
+- **Username**: `admin`
+- **Retrieve Password**:
   ```bash
-  # Retrieve superuser credentials
-  kubectl get secret cassandra-cluster-superuser -n k8ssandra-operator -o jsonpath='{.data.username}' | base64 -d; echo
-  kubectl get secret cassandra-cluster-superuser -n k8ssandra-operator -o jsonpath='{.data.password}' | base64 -d; echo
-
-  # Connect to CQL shell
-  kubectl exec -it cassandra-cluster-dc1-default-sts-0 -n k8ssandra-operator -c cassandra -- cqlsh -u <username> -p <password>
+  kubectl get secret prometheus-grafana -n k8ssandra-operator -o jsonpath='{.data.admin-password}' | base64 -d; echo
   ```
 
-- **Grafana Dashboard**:
-  - **URL**: `http://<node-ip>:32000`
-  - **Username**: `admin`
-  - **Password**:
-    ```bash
-    kubectl get secret prometheus-grafana -n k8ssandra-operator -o jsonpath='{.data.admin-password}' | base64 -d; echo
-    ```
+#### Install Reaper (Automated Repairs)
+Enables Reaper in the `K8ssandraCluster` spec across all datacenters and exposes the management UI on NodePort `32080`:
 
-- **Reaper UI (Automated Repairs)**:
-  - **URL**: `http://<node-ip>:32080/webui`
-  - **Credentials**:
-    ```bash
-    kubectl get secret cassandra-cluster-reaper-ui -n k8ssandra-operator -o jsonpath='{.data.password}' | base64 -d; echo
-    ```
+```bash
+sudo bash scripts/k8ssandra-addons-setup.sh --reaper
+```
 
-### 2. Backups & Restores (`scripts/k8ssandra-backup-setup.sh`)
-
-- **In-Cluster SeaweedFS (Local S3 Storage)**:
+- **Access Reaper Web UI**: `http://<node-ip>:32080/webui`
+- **Retrieve Credentials**:
   ```bash
-  sudo bash scripts/k8ssandra-backup-setup.sh --seaweedfs --medusa --test-backup
+  # Username
+  kubectl get secret cassandra-cluster-reaper-ui -n k8ssandra-operator -o jsonpath='{.data.username}' | base64 -d; echo
+  # Password
+  kubectl get secret cassandra-cluster-reaper-ui -n k8ssandra-operator -o jsonpath='{.data.password}' | base64 -d; echo
   ```
 
-- **AWS S3 / S3-Compatible Remote Storage**:
-  ```bash
-  export MEDUSA_ACCESS_KEY="<ACCESS_KEY>"
-  export MEDUSA_SECRET_KEY="<SECRET_KEY>"
+#### Install All Addons Together
+```bash
+sudo bash scripts/k8ssandra-addons-setup.sh --all
+```
 
-  sudo -E bash scripts/k8ssandra-backup-setup.sh --medusa \
-    --medusa-bucket cassandra-backups \
-    --medusa-region us-east-1
-  ```
+---
+
+### 2. Backup & Restore with Medusa (`scripts/k8ssandra-backup-setup.sh`)
+
+This dedicated script manages backup infrastructure and Medusa integration.
+
+#### Option A: In-Cluster Backup with SeaweedFS (No AWS Account Required)
+Deploys SeaweedFS S3-compatible object store on local storage, creates the backup bucket, configures Medusa, and triggers an initial test backup:
+
+```bash
+sudo bash scripts/k8ssandra-backup-setup.sh --seaweedfs --medusa --test-backup
+```
+
+#### Option B: AWS S3 Backup (IAM Role / No Keys)
+Uses EC2 IAM Instance Profile / EKS IRSA credentials:
+
+```bash
+sudo bash scripts/k8ssandra-backup-setup.sh --medusa \
+  --medusa-bucket my-cassandra-backups \
+  --medusa-region us-east-1 \
+  --medusa-credentials-type role-based
+```
+
+#### Option C: AWS S3 or S3-Compatible Remote Storage (MinIO, Wasabi, Ceph RGW)
+Pass credentials safely via environment variables:
+
+```bash
+export MEDUSA_ACCESS_KEY="<YOUR_ACCESS_KEY>"
+export MEDUSA_SECRET_KEY="<YOUR_SECRET_KEY>"
+
+# AWS S3 with access keys
+sudo -E bash scripts/k8ssandra-backup-setup.sh --medusa \
+  --medusa-bucket my-cassandra-backups \
+  --medusa-region us-east-1
+
+# S3-compatible remote storage (e.g. MinIO)
+sudo -E bash scripts/k8ssandra-backup-setup.sh --medusa \
+  --medusa-provider s3_compatible \
+  --medusa-bucket cassandra-backups \
+  --medusa-host minio.example.com \
+  --medusa-port 9000 \
+  --medusa-secure false
+```
+
+#### Backup Operations
 
 - **Trigger an Ad-hoc Backup**:
   ```bash
@@ -198,7 +242,41 @@ bash scripts/k8s-k8ssandra-setup.sh --role k8ssandra \
   EOF
   ```
 
-### 3. Adding a Cassandra Datacenter (`scripts/k8ssandra-add-dc.sh`)
+- **List Backup Jobs & Completed Backups**:
+  ```bash
+  kubectl get medusabackupjob -n k8ssandra-operator
+  kubectl get medusabackup -n k8ssandra-operator
+  ```
+
+- **Restore from Backup**:
+  ```bash
+  kubectl apply -n k8ssandra-operator -f - <<EOF
+  apiVersion: medusa.k8ssandra.io/v1alpha1
+  kind: MedusaRestoreJob
+  metadata:
+    name: restore-$(date +%Y%m%d-%H%M)
+  spec:
+    cassandraDatacenter: dc1
+    backup: <backup-name>
+  EOF
+  ```
+
+---
+
+## Cluster Operations
+
+### Connecting to Cassandra (CQL)
+
+```bash
+# Retrieve superuser credentials
+kubectl get secret cassandra-cluster-superuser -n k8ssandra-operator -o jsonpath='{.data.username}' | base64 -d; echo
+kubectl get secret cassandra-cluster-superuser -n k8ssandra-operator -o jsonpath='{.data.password}' | base64 -d; echo
+
+# Connect via cqlsh inside a Cassandra pod
+kubectl exec -it cassandra-cluster-dc1-default-sts-0 -n k8ssandra-operator -c cassandra -- cqlsh -u <username> -p <password>
+```
+
+### Adding a Datacenter (`scripts/k8ssandra-add-dc.sh`)
 
 1. Add sufficient worker nodes first using `--role add-workers`.
 2. Deploy the new datacenter and update keyspace replication:
@@ -216,7 +294,7 @@ bash scripts/k8s-k8ssandra-setup.sh --role k8ssandra \
   sudo bash scripts/k8ssandra-cleanup.sh --scope k8ssandra
   ```
 
-- **Remove Specific Components**:
+- **Remove Specific Addons**:
   ```bash
   sudo bash scripts/k8ssandra-cleanup.sh --scope monitoring
   sudo bash scripts/k8ssandra-cleanup.sh --scope medusa,seaweedfs
@@ -229,14 +307,6 @@ bash scripts/k8s-k8ssandra-setup.sh --role k8ssandra \
 
 ---
 
-## Troubleshooting
-
-| Symptom | Diagnostic Command / Action |
-|---|---|
-| **Worker node join fails** | Check logs: `/var/log/k8ssandra-setup-worker-<ip>.log` on control plane. Verify SSH connectivity and security group port `6443`. |
-| **Nodes in `NotReady` status** | Inspect Calico daemonset: `kubectl -n kube-system get pods -l k8s-app=calico-node`. Verify UDP port `4789` is open. |
-| **Cassandra pods `Pending`** | Run `kubectl describe pod <pod-name> -n k8ssandra-operator`. Ensure each pod has a dedicated worker node (anti-affinity). |
-| **Storage PVC Unbound** | Check storage class: `kubectl get sc,pvc -n k8ssandra-operator` and verify `local-path-provisioner` pods are running in `local-path-storage`. |
 
 For in-depth operational procedures, consult [`docs/k8ssandra-runbook.md`](docs/k8ssandra-runbook.md).
 
