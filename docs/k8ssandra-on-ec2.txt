@@ -1,0 +1,521 @@
+{toc:maxLevel=2}
+
+h1. K8ssandra on EC2 — Installation, Backups and Operations Guide
+
+{info:title=Summary}
+Automated scripts that build a Kubernetes cluster on plain EC2 instances (kubeadm, no EKS) and run Apache Cassandra on it with the K8ssandra Operator. Covers monitoring (Prometheus/Grafana), repairs (Reaper), backups (Medusa to in-cluster SeaweedFS, AWS S3 or other S3-compatible storage) and adding datacenters.
+{info}
+
+{warning:title=Scope}
+This setup is intended for lab, test and pre-production use: one control-plane node, and by default Cassandra data on the nodes' local disks (local-path). See *Known limitations* before using it for production data.
+{warning}
+
+----
+
+h2. 1. Architecture
+
+||Component||Default version||Purpose||
+|Kubernetes (kubeadm, kubelet, kubectl)|1.36|Container orchestration|
+|containerd|from OS / Docker repo|Container runtime|
+|Calico CNI (VXLAN overlay)|v3.33.0|Pod networking between nodes|
+|local-path-provisioner|v0.0.37|Storage on each node's disk ({{/opt/local-path-provisioner}})|
+|Helm|v3.22.1 (only if missing)|Package installs|
+|cert-manager|v1.21.3|TLS certificates, required by K8ssandra|
+|K8ssandra Operator (Helm chart)|1.33.0|Manages Cassandra lifecycle|
+|Apache Cassandra|4.1.8|Database (5.0.x also supported)|
+|Prometheus + Grafana|kube-prometheus-stack|Metrics and dashboards (optional)|
+|Reaper|via K8ssandra|Scheduled repairs (optional)|
+|SeaweedFS|chart 4.51.0|In-cluster S3-compatible backup storage (optional)|
+|Medusa|via K8ssandra|Backup and restore (optional)|
+
+Default layout: *1 control-plane node + 3 worker nodes*. Each Cassandra pod needs its own worker node, so the number of workers must be at least the datacenter size.
+
+----
+
+h2. 2. Prerequisites
+
+h3. 2.1 EC2 instances
+
+||Role||Count||Instance type||Root disk||
+|Control plane|1|t3.medium or larger (minimum 2 vCPU)|30 GB|
+|Workers|3 (one per Cassandra node)|t3.large minimum, t3.xlarge recommended|50 GB+ (Cassandra data and local backups live here)|
+
+* *AMI: Ubuntu 24.04 LTS (noble)* — recommended. Ubuntu 22.04 (jammy) also works.
+* All nodes use the *same AMI*, the *same VPC/subnet* and the *same security group*.
+
+{warning:title=Do not use Ubuntu 18.04 (bionic) or 20.04 (focal)}
+They boot with cgroups v1. Kubernetes 1.35 and later refuses to start on cgroups v1 ({{kubeadm init}} fails with "cgroups v1 support is deprecated"). The setup script detects this on every node and stops before installing anything.
+{warning}
+
+Quick check on any node:
+{code:language=bash}
+lsb_release -cs                  # noble (or jammy)
+stat -fc %T /sys/fs/cgroup       # must print: cgroup2fs
+{code}
+
+h3. 2.2 Security group
+
+||Rule||Source||Purpose||
+|All traffic|the security group itself|Kubernetes API, kubelet, etcd, Calico VXLAN (UDP 4789), Cassandra (7000/7001/9042)|
+|TCP 22|your IP|SSH|
+|TCP 32000, 32080 (optional)|your IP only|Grafana and Reaper UIs|
+
+Never open these ports to {{0.0.0.0/0}}.
+
+h3. 2.3 User and SSH access
+
+* A user (here {{automaton}}) exists on all nodes with *passwordless sudo*.
+* The control plane can SSH to every worker as that user *without a password*.
+* The setup script runs with {{sudo}}, so SSH is made as root using the key given in {{SSH_KEY}} (e.g. {{/home/automaton/.ssh/id_ed25519}}).
+
+Verify from the control plane before installing:
+{code:language=bash}
+for w in 172.31.10.11 172.31.10.12 172.31.10.13; do
+  sudo ssh -i /home/automaton/.ssh/id_ed25519 -o BatchMode=yes automaton@$w 'sudo -n true' && echo "$w OK" || echo "$w FAILED"
+done
+{code}
+
+If SSH works through an agent instead of a key file, leave {{SSH_KEY}} empty and run the setup with {{sudo --preserve-env=SSH_AUTH_SOCK bash ...}}.
+
+----
+
+h2. 3. Repository layout
+
+{code:language=none}
+k8ssandra-on-ec2/
+├── scripts/
+│   ├── k8s-k8ssandra-setup.sh       # Main installer: Kubernetes + K8ssandra + Cassandra (all roles)
+│   ├── k8ssandra-addons-setup.sh    # Monitoring (Prometheus + Grafana) and Reaper
+│   ├── k8ssandra-backup-setup.sh    # SeaweedFS + Medusa backups, test backup
+│   ├── k8ssandra-add-dc.sh          # Add a Cassandra datacenter
+│   ├── k8ssandra-cleanup.sh         # Remove K8ssandra, or tear down every node
+│   └── fix-pvc-ebs.sh               # Legacy EBS helper (prefer --storage-class ebs-gp3)
+├── manifests/
+│   ├── local-path-provisioner.yaml  # Applied by the setup script
+│   └── cassandra-cluster.yaml       # Example spec for --cluster-manifest
+├── config/
+│   ├── cluster.env.example          # Every setting, documented
+│   └── kube-prom-stack-values.yaml
+└── docs/
+{code}
+
+----
+
+h2. 4. Installation
+
+h3. 4.1 Copy the project to the control plane
+
+From your workstation (excludes local-only folders):
+{code:language=bash}
+cd ~/Desktop/k8ssandra-on-ec2-v1
+rsync -av --exclude 'clean/' --exclude '_backup-*/' --exclude '.git/' --exclude '.DS_Store' \
+  ./ automaton@<CONTROL_PLANE_IP>:~/k8ssandra/
+{code}
+
+h3. 4.2 Create the configuration
+
+On the control plane:
+{code:language=bash}
+cd ~/k8ssandra
+cp config/cluster.env.example cluster.env
+ls ~/.ssh/          # note the private key name
+nano cluster.env
+{code}
+
+Minimum settings (workers' *private* IPs):
+{code:language=bash}
+WORKERS="172.31.10.11,172.31.10.12,172.31.10.13"
+SSH_USER=automaton
+SSH_KEY=/home/automaton/.ssh/id_ed25519
+{code}
+
+h3. 4.3 Preview (installs nothing)
+
+{code:language=bash}
+bash scripts/k8s-k8ssandra-setup.sh --role all --config cluster.env --print-config   # effective settings
+bash scripts/k8s-k8ssandra-setup.sh --config cluster.env --render-only               # Cassandra manifest that will be applied
+{code}
+
+h3. 4.4 Run the installer
+
+{code:language=bash}
+sudo bash scripts/k8s-k8ssandra-setup.sh --role all --config cluster.env
+{code}
+
+Answer {{y}} at the confirmation prompt. The run takes about 20–30 minutes and ends with a *DONE* banner.
+
+||Step||What happens||
+|0|Validates settings; checks SSH, passwordless sudo and cgroups v2 on every worker — before changing anything|
+|1|Prepares the control plane: swap off, kernel settings, containerd, kubeadm/kubelet|
+|2|{{kubeadm init}}, then Calico (pod CIDR checked against the VPC CIDR)|
+|3|Copies the script to every worker over SSH and joins them in parallel|
+|4|Waits until all workers are Ready|
+|5|Installs storage, cert-manager and the K8ssandra Operator|
+|6|Generates and applies the K8ssandraCluster (saved to {{/root/k8ssandra-<cluster>.yaml}})|
+|7|Waits until the Cassandra datacenter is Ready|
+
+{tip:title=Safe to re-run}
+If a step fails, fix the cause and run the same command again. Completed steps are detected and skipped (initialised control plane, joined workers, installed Helm releases).
+{tip}
+
+h3. 4.5 Verify
+
+{code:language=bash}
+kubectl get nodes -o wide                       # 4 nodes, all Ready
+kubectl -n k8ssandra-operator get pods          # Cassandra pods Running
+
+POD=$(kubectl -n k8ssandra-operator get pods -l cassandra.datastax.com/datacenter=dc1 -o jsonpath='{.items[0].metadata.name}')
+CU=$(kubectl -n k8ssandra-operator get secret cassandra-cluster-superuser -o jsonpath='{.data.username}' | base64 -d)
+CP=$(kubectl -n k8ssandra-operator get secret cassandra-cluster-superuser -o jsonpath='{.data.password}' | base64 -d)
+kubectl -n k8ssandra-operator exec $POD -c cassandra -- nodetool -u $CU -pw $CP status    # 3 lines starting "UN"
+{code}
+
+h3. 4.6 Installer roles
+
+||Role||Run on||Does||
+|{{all}}|control plane|Everything above|
+|{{control-plane}}|control plane|Kubernetes + CNI (+ joins workers if given); no K8ssandra|
+|{{add-workers}}|control plane|Joins more workers to a running cluster over SSH|
+|{{worker}}|a worker|Manual join with {{--join-command}}|
+|{{k8ssandra}}|anywhere with kubectl|K8ssandra + Cassandra on an existing cluster ({{--kubeconfig}})|
+
+----
+
+h2. 5. Configuration reference
+
+Every setting can be a command-line flag, a line in {{cluster.env}}, or an environment variable (in that order of priority). {{--help}} lists all flags.
+
+||Setting (cluster.env)||Flag||Default||Notes||
+|WORKERS|{{--workers}}|—|Comma-separated private IPs|
+|{{SSH_USER}} / {{SSH_KEY}}|{{--ssh-user}} / {{--ssh-key}}|ec2-user / ssh default|User and key for worker SSH|
+|{{K8S_VERSION}}|{{--k8s-version}}|1.36|Minor version only|
+|{{POD_CIDR}}|{{--pod-cidr}}|192.168.0.0/16|Must not overlap the VPC|
+|{{SERVICE_CIDR}}|{{--service-cidr}}|10.96.0.0/12| |
+|{{CALICO_ENCAP}}|{{--calico-encap}}|VXLAN|IPIP needs IP protocol 4 + TCP 179 open|
+|{{STORAGE_CLASS}}|{{--storage-class}}|local-path|local-path, ebs-gp3, or an existing class|
+|{{STORAGE_SIZE}}|{{--storage-size}}|20Gi|Per Cassandra node|
+|{{OPERATOR_VERSION}}|{{--operator-version}}|1.33.0|K8ssandra Operator chart|
+|{{CLUSTER_NAME}}|{{--cluster-name}}|cassandra-cluster| |
+|{{CASSANDRA_VERSION}}|{{--cassandra-version}}|4.1.8|4.1.x or 5.0.x|
+|{{DC_NAME}} / {{DC_SIZE}}|{{--dc-name}} / {{--dc-size}}|dc1 / 3|DC size needs that many free workers|
+|{{HEAP_SIZE}}|{{--heap-size}}|2048M|About 1/4–1/2 of pod memory|
+|{{CASSANDRA_CPU}} / {{CASSANDRA_MEMORY}}|{{--cpu}} / {{--memory}}|unset|Pod requests; memory also set as limit|
+|RACKS|{{--racks}}|none|{{zone}} = one rack per availability zone|
+|{{CLUSTER_MANIFEST}}|{{--cluster-manifest}}|—|Apply your own K8ssandraCluster YAML instead|
+
+----
+
+h2. 6. Monitoring and repairs (Grafana, Prometheus, Reaper)
+
+{code:language=bash}
+sudo bash scripts/k8ssandra-addons-setup.sh --monitoring --reaper
+kubectl -n k8ssandra-operator get pods | grep -E 'grafana|prometheus|reaper'    # all Running
+{code}
+
+||Service||Access||Credentials||
+|Grafana|{{http://<node-ip>:32000}}|user {{admin}}; password below|
+|Reaper UI|{{http://<node-ip>:32080/webui}}|from secret {{cassandra-cluster-reaper-ui}}|
+
+{code:language=bash}
+# Grafana admin password (random, kept across re-runs)
+kubectl -n k8ssandra-operator get secret prometheus-grafana -o jsonpath='{.data.admin-password}' | base64 -d; echo
+
+# Reaper UI credentials
+kubectl -n k8ssandra-operator get secret cassandra-cluster-reaper-ui -o jsonpath='{.data.username}' | base64 -d; echo
+kubectl -n k8ssandra-operator get secret cassandra-cluster-reaper-ui -o jsonpath='{.data.password}' | base64 -d; echo
+{code}
+
+Reaper is exposed through its own NodePort service ({{cassandra-cluster-dc1-reaper-nodeport}}): 32080 for dc1, 32090 for dc2, and so on. Re-run the command above after adding a datacenter to expose that DC's Reaper too.
+
+----
+
+h2. 7. Backups (SeaweedFS and Medusa)
+
+Backups are handled by a separate script, {{scripts/k8ssandra-backup-setup.sh}}. The addons script above is not involved.
+
+||Flag||Does||
+|{{--seaweedfs}}|Installs SeaweedFS in the cluster (single pod, data on a 50 GB volume) and creates the bucket {{cassandra-backups}}|
+|{{--medusa}}|Enables Medusa and waits until every Cassandra pod has restarted with the Medusa container. With {{--seaweedfs}}, Medusa is connected to SeaweedFS automatically (endpoint and keys).|
+|{{--test-backup}}|Runs one backup on the first DC and waits for it to finish|
+
+Run {{bash scripts/k8ssandra-backup-setup.sh --help}} for all options.
+
+h3. 7.1 Option A — In-cluster SeaweedFS (no AWS needed)
+
+*Step 1 — install SeaweedFS*
+{code:language=bash}
+cd ~/k8ssandra
+sudo bash scripts/k8ssandra-backup-setup.sh --seaweedfs
+kubectl -n seaweedfs get pods,pvc       # all-in-one pod Running, PVC Bound
+{code}
+Optional settings, placed in front of the command: {{SEAWEEDFS_SIZE=100Gi}}, {{MEDUSA_BUCKET=my-backups}}, {{SEAWEEDFS_STORAGE_CLASS=...}}
+
+*Step 2 — enable Medusa* (keep {{--seaweedfs}} in the command so Medusa is wired to it)
+{code:language=bash}
+sudo bash scripts/k8ssandra-backup-setup.sh --seaweedfs --medusa
+kubectl -n k8ssandra-operator get pods -l cassandra.datastax.com/datacenter=dc1   # each 3/3 Running
+{code}
+Cassandra pods restart one at a time (10–20 minutes). The script reports when all of them run Medusa.
+
+*Step 3 — test backup*
+{code:language=bash}
+sudo bash scripts/k8ssandra-backup-setup.sh --test-backup
+kubectl -n k8ssandra-operator get medusabackupjob
+kubectl -n k8ssandra-operator get medusabackup
+{code}
+
+*Optional — list files in the bucket*
+{code:language=bash}
+AK=$(kubectl -n seaweedfs get secret seaweedfs-s3-secret -o jsonpath='{.data.admin_access_key_id}' | base64 -d)
+SK=$(kubectl -n seaweedfs get secret seaweedfs-s3-secret -o jsonpath='{.data.admin_secret_access_key}' | base64 -d)
+kubectl run awscli -n seaweedfs --rm -it --restart=Never --image=amazon/aws-cli:2.17.0 \
+  --env AWS_ACCESS_KEY_ID=$AK --env AWS_SECRET_ACCESS_KEY=$SK --env AWS_DEFAULT_REGION=us-east-1 -- \
+  --endpoint-url http://seaweedfs-all-in-one.seaweedfs.svc.cluster.local:8333 \
+  s3 ls s3://cassandra-backups/cassandra-cluster/ --recursive --summarize
+{code}
+
+{note:title=SeaweedFS limits}
+With local-path storage, backups live on one worker's disk inside the same cluster as Cassandra. Good for testing backup and restore; it does not protect against losing that node or the whole cluster. For real disaster recovery use AWS S3 or storage outside the cluster.
+{note}
+
+h3. 7.2 Option B — AWS S3 with access keys
+
+1. Create the bucket in the target region:
+{code:language=bash}
+aws s3 mb s3://my-cassandra-backups --region ap-south-1
+{code}
+2. Create an IAM user with an access key and this policy (replace the bucket name):
+{code:language=json}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::my-cassandra-backups" },
+    { "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::my-cassandra-backups/*" }
+  ]
+}
+{code}
+3. Run (keys passed through the environment, never on the command line):
+{code:language=bash}
+export MEDUSA_ACCESS_KEY='AKIA...' MEDUSA_SECRET_KEY='...'
+sudo -E bash scripts/k8ssandra-backup-setup.sh --medusa \
+  --medusa-bucket my-cassandra-backups --medusa-region ap-south-1 --test-backup
+unset MEDUSA_ACCESS_KEY MEDUSA_SECRET_KEY
+aws s3 ls s3://my-cassandra-backups/cassandra-cluster/ --recursive --summarize
+{code}
+
+h3. 7.3 Option C — AWS S3 with an IAM role (no keys)
+
+1. Attach an IAM role with the policy above as the instance profile on *all worker nodes*.
+2. Allow pods to reach the instance credentials (each worker):
+{code:language=bash}
+aws ec2 modify-instance-metadata-options --instance-id <worker-id> \
+  --http-put-response-hop-limit 2 --http-endpoint enabled
+{code}
+3. Run:
+{code:language=bash}
+sudo bash scripts/k8ssandra-backup-setup.sh --medusa \
+  --medusa-bucket my-cassandra-backups --medusa-region ap-south-1 \
+  --medusa-credentials-type role-based --test-backup
+{code}
+K8ssandra documents role-based credentials mainly for EKS; on self-managed EC2 it relies on the instance profile. Option B is the more certain first test.
+
+h3. 7.4 Option D — Other S3-compatible storage (MinIO, Wasabi, Ceph RGW)
+
+{code:language=bash}
+export MEDUSA_ACCESS_KEY='...' MEDUSA_SECRET_KEY='...'
+sudo -E bash scripts/k8ssandra-backup-setup.sh --medusa \
+  --medusa-provider s3_compatible --medusa-bucket cassandra-backups \
+  --medusa-host <storage-host-or-ip> --medusa-port 9000 --medusa-secure false
+# HTTPS with a self-signed certificate:  --medusa-port 443 --medusa-secure true --medusa-ssl-verify false
+# Ceph RADOS Gateway:                     --medusa-provider s3_rgw
+{code}
+The bucket must already exist, and the nodes must be able to reach the endpoint. The script checks reachability from inside the cluster first.
+
+h3. 7.5 Scheduled backups and retention
+
+{code:language=bash}
+# Daily differential backup at 01:00 UTC for every DC, keep the last 7
+sudo MEDUSA_BACKUP_SCHEDULE="0 1 * * *" MEDUSA_MAX_BACKUP_COUNT=7 \
+  bash scripts/k8ssandra-backup-setup.sh --seaweedfs --medusa
+kubectl -n k8ssandra-operator get medusabackupschedule
+{code}
+For AWS, add the same two variables in front of your AWS command (with {{sudo -E}}).
+
+h3. 7.6 Manual backup
+
+{code:language=bash}
+kubectl -n k8ssandra-operator apply -f - <<EOF
+apiVersion: medusa.k8ssandra.io/v1alpha1
+kind: MedusaBackupJob
+metadata:
+  name: backup-$(date +%Y%m%d-%H%M)
+spec:
+  cassandraDatacenter: dc1
+EOF
+kubectl -n k8ssandra-operator get medusabackupjob -w     # done when FINISHED is set
+{code}
+
+h3. 7.7 Restore (test on a non-production cluster)
+
+{warning}
+A restore stops all Cassandra pods of that datacenter for a few minutes and replaces its data with the backup.
+{warning}
+
+*a) Create test data*
+{code:language=bash}
+POD=$(kubectl -n k8ssandra-operator get pods -l cassandra.datastax.com/datacenter=dc1 -o jsonpath='{.items[0].metadata.name}')
+CU=$(kubectl -n k8ssandra-operator get secret cassandra-cluster-superuser -o jsonpath='{.data.username}' | base64 -d)
+CP=$(kubectl -n k8ssandra-operator get secret cassandra-cluster-superuser -o jsonpath='{.data.password}' | base64 -d)
+kubectl -n k8ssandra-operator exec $POD -c cassandra -- cqlsh -u $CU -p $CP -e "
+  CREATE KEYSPACE IF NOT EXISTS demo WITH replication = {'class':'NetworkTopologyStrategy','dc1':3};
+  CREATE TABLE IF NOT EXISTS demo.t (id int PRIMARY KEY, v text);
+  INSERT INTO demo.t (id, v) VALUES (1, 'before-backup');"
+{code}
+*b) Back up and note the backup name*
+{code:language=bash}
+sudo bash scripts/k8ssandra-backup-setup.sh --test-backup
+kubectl -n k8ssandra-operator get medusabackup
+{code}
+*c) Change data after the backup*
+{code:language=bash}
+kubectl -n k8ssandra-operator exec $POD -c cassandra -- cqlsh -u $CU -p $CP -e \
+  "INSERT INTO demo.t (id, v) VALUES (2, 'after-backup');"
+{code}
+*d) Restore*
+{code:language=bash}
+kubectl -n k8ssandra-operator apply -f - <<EOF
+apiVersion: medusa.k8ssandra.io/v1alpha1
+kind: MedusaRestoreJob
+metadata:
+  name: restore-test
+spec:
+  cassandraDatacenter: dc1
+  backup: <BACKUP-NAME-FROM-STEP-b>
+EOF
+kubectl -n k8ssandra-operator get medusarestorejob restore-test -w
+kubectl -n k8ssandra-operator get pods -w          # pods restart, back to 3/3
+{code}
+*e) Verify* — only row 1 ({{before-backup}}) should remain:
+{code:language=bash}
+POD=$(kubectl -n k8ssandra-operator get pods -l cassandra.datastax.com/datacenter=dc1 -o jsonpath='{.items[0].metadata.name}')
+kubectl -n k8ssandra-operator exec $POD -c cassandra -- cqlsh -u $CU -p $CP -e "SELECT * FROM demo.t;"
+{code}
+
+----
+
+h2. 8. Adding a datacenter
+
+h3. 8.1 Add worker nodes
+
+Launch 3 more instances (same AMI, subnet, security group and {{automaton}} setup), then from the control plane:
+{code:language=bash}
+sudo bash scripts/k8s-k8ssandra-setup.sh --role add-workers --config cluster.env \
+  --workers 172.31.10.14,172.31.10.15,172.31.10.16
+{code}
+
+h3. 8.2 Add the datacenter
+
+{code:language=bash}
+# List ALL your own keyspaces with the replica count wanted in dc2 (0 = none)
+sudo bash scripts/k8ssandra-add-dc.sh --dc-name dc2 --dc-size 3 \
+  --replication '{"orders": 3, "users": 3}'
+kubectl -n k8ssandra-operator get cassandradatacenter -w        # dc2 becomes Ready
+{code}
+
+* Storage class and heap size are copied from dc1 unless {{--storage-class}} / {{--heap-size}} are given.
+* Without {{--replication}}, only system and K8ssandra keyspaces get replicas in dc2; your keyspaces do not.
+* The script warns if there are fewer free worker nodes than the DC size.
+
+h3. 8.3 Backups and repairs with two datacenters
+
+||Topic||Behaviour||
+|Medusa|Cluster-wide setting: dc2 pods start with Medusa automatically. Same bucket and folder as dc1.|
+|Backups|Per DC. {{--test-backup}} uses dc1. Back up dc2 with a MedusaBackupJob that sets {{cassandraDatacenter: dc2}}.|
+|Schedules|Created for the DCs that exist when the script runs. After adding dc2, re-run the schedule command (section 7.5) to add dc2's schedule.|
+|Restore|Per DC. The backup must come from the same DC, which must have the same number of nodes. Only that DC's pods stop.|
+|Storage|Backing up both DCs roughly doubles backup storage.|
+|Reaper UI|Re-run {{k8ssandra-addons-setup.sh --reaper}} to expose dc2's Reaper on port 32090.|
+
+If keyspaces replicate to both DCs, each DC holds a full copy, so backing up one DC protects all data. Backing up both allows restoring either DC independently.
+
+----
+
+h2. 9. Day-to-day commands
+
+{code:language=bash}
+# Cluster state
+kubectl get nodes -o wide
+kubectl -n k8ssandra-operator get k8ssandracluster,cassandradatacenter
+kubectl -n k8ssandra-operator get pods -o wide
+
+# cqlsh / nodetool on the first dc1 pod
+POD=$(kubectl -n k8ssandra-operator get pods -l cassandra.datastax.com/datacenter=dc1 -o jsonpath='{.items[0].metadata.name}')
+kubectl -n k8ssandra-operator exec -it $POD -c cassandra -- cqlsh -u $CU -p $CP
+kubectl -n k8ssandra-operator exec $POD -c cassandra -- nodetool -u $CU -pw $CP status
+
+# Logs
+kubectl -n k8ssandra-operator logs $POD -c cassandra --tail=100
+kubectl -n k8ssandra-operator logs $POD -c medusa --tail=100
+{code}
+
+----
+
+h2. 10. Cleanup
+
+{code:language=bash}
+# Remove K8ssandra, addons and SeaweedFS; keep Kubernetes
+sudo bash scripts/k8ssandra-cleanup.sh --scope k8ssandra
+
+# Tear down every node (asks you to type 'destroy')
+sudo bash scripts/k8ssandra-cleanup.sh --scope full \
+  --ssh-user automaton --ssh-key /home/automaton/.ssh/id_ed25519
+{code}
+
+{note}
+Removing SeaweedFS deletes the backups stored in it. Backups in AWS S3 are not touched by cleanup. With the ebs-gp3 storage class (reclaim policy Retain), EBS volumes survive cleanup and must be deleted in the EC2 console.
+{note}
+
+----
+
+h2. 11. Troubleshooting
+
+||Symptom||Cause / where to look||
+|{{kubeadm init}}: "cgroups v1 support is deprecated"|Ubuntu 18.04/20.04. Use Ubuntu 24.04 (noble) or 22.04 (jammy).|
+|Warning "RuntimeConfig ... Unimplemented"|Old containerd (old Ubuntu). Warning only; goes away on 24.04.|
+|Script stops at SSH check|Key path, user, port 22 in the security group, or missing passwordless sudo on the worker|
+|A worker did not join|{{/var/log/k8ssandra-setup-worker-<ip>.log}} on the control plane|
+|Any installer failure|{{/var/log/k8ssandra-setup.log}} (last 30 lines)|
+|Nodes NotReady|{{kubectl -n kube-system get pods -o wide}} (Calico) and the "all traffic from itself" security group rule|
+|Cassandra pods Pending|{{kubectl -n k8ssandra-operator describe pod <pod>}}: too few free nodes (one pod per node) or unbound PVC|
+|Datacenter never Ready|{{kubectl -n k8ssandra-operator describe cassandradatacenter dc1}}|
+|SeaweedFS pod Pending|{{kubectl -n seaweedfs describe pvc seaweedfs-all-in-one-data}}|
+|SeaweedFS install times out|{{kubectl -n seaweedfs get jobs,pods}} and the bucket job's logs|
+|Cassandra pods stuck at 2/3 after enabling Medusa|{{kubectl -n k8ssandra-operator logs <pod> -c medusa}} (keys, bucket, endpoint)|
+|Backup fails with AccessDenied|IAM policy or bucket name/region (AWS)|
+|Backup job never finishes|{{kubectl -n k8ssandra-operator describe medusabackupjob <name>}} plus medusa logs|
+|Restore stuck|{{kubectl -n k8ssandra-operator describe medusarestorejob <name>}} and {{logs <pod> -c medusa-restore}}|
+
+----
+
+h2. 12. Known limitations
+
+* *Single control plane* — if that node is lost, Kubernetes management is lost (Cassandra keeps running). Use {{--control-plane-endpoint}} with a load balancer as a starting point for HA.
+* *local-path storage* — Cassandra data lives on node disks; losing a node loses that replica (Cassandra replication covers it, but the node must be rebuilt). Use {{--storage-class ebs-gp3}} for durable volumes; a datacenter's storage class cannot be changed after creation.
+* *SeaweedFS* runs as one pod on one disk: suitable for testing backups, not for disaster recovery.
+* *Grafana 7.5.11* is the version the K8ssandra dashboards target; it is old and the kube-prometheus-stack chart is not pinned.
+* *Prometheus* has no persistent storage; metrics history is lost when its pod restarts.
+* Medusa role-based credentials on self-managed EC2 rely on the instance profile and IMDS hop limit 2 and are less tested than access keys.
+
+----
+
+h2. 13. References
+
+* K8ssandra Operator documentation: https://docs.k8ssandra.io
+* Medusa backup and restore: https://docs.k8ssandra.io/tasks/backup-restore/
+* SeaweedFS Helm chart: https://artifacthub.io/packages/helm/seaweedfs/seaweedfs
+* Calico: https://docs.tigera.io/calico/latest/
+* Kubernetes cgroup v1 removal (KEP-5573): https://git.k8s.io/enhancements/keps/sig-node/5573-remove-cgroup-v1

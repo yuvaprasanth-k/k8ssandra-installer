@@ -13,14 +13,39 @@
 #   Full teardown — all nodes automatically:
 #     sudo bash scripts/k8ssandra-cleanup.sh --scope full
 #
-#   Full teardown with custom SSH user/key:
+#   Remove only some components:
+#     sudo bash scripts/k8ssandra-cleanup.sh --scope monitoring
+#     sudo bash scripts/k8ssandra-cleanup.sh --scope medusa
+#     sudo bash scripts/k8ssandra-cleanup.sh --scope medusa,seaweedfs
+#
+#   Full teardown using the same config file as the installer
+#   (reads SSH_USER, SSH_KEY, SSH_PORT):
+#     sudo bash scripts/k8ssandra-cleanup.sh --scope full --config cluster.env
+#
+#   Full teardown with explicit SSH user/key:
 #     sudo bash scripts/k8ssandra-cleanup.sh --scope full \
-#       --ssh-user ubuntu --ssh-key /root/.ssh/my-key.pem
+#       --ssh-user automaton --ssh-key /home/automaton/.ssh/id_ed25519
 #
 # Options:
-#   --scope      k8ssandra | full  (required)
+#   --scope      (required) one of:
+#                  k8ssandra   remove the whole K8ssandra stack + addons, keep Kubernetes
+#                  full        tear down Kubernetes on every node
+#                or one or more of these, comma-separated (e.g. medusa,seaweedfs):
+#                  monitoring  Prometheus + Grafana (and the Cassandra dashboards)
+#                  medusa      Medusa from the K8ssandraCluster (rolling restart of Cassandra),
+#                              its schedules, jobs and credentials secret.
+#                              Backup data in the bucket is NOT deleted.
+#                  seaweedfs   SeaweedFS and its volume — DELETES the backups stored in it.
+#                              Refused while Medusa still points at SeaweedFS (add medusa).
+#   --cluster-name / --namespace   K8ssandraCluster (default cassandra-cluster / k8ssandra-operator)
+#   --config     Installer config file (cluster.env); flags override it
 #   --ssh-user   SSH user for worker nodes (default: ec2-user)
-#   --ssh-key    Path to SSH private key   (default: ~/.ssh/id_rsa)
+#   --ssh-key    Path to SSH private key (default: ssh's own defaults for root)
+#   --ssh-port   SSH port (default 22)
+#   --yes        Skip the confirmation prompt for --scope full
+#
+# For --scope full, SSH + sudo to every worker is checked BEFORE anything
+# is removed, so a wrong key never leaves the cluster half-deleted.
 # ============================================================
 
 set -euo pipefail
@@ -32,23 +57,54 @@ success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
+# ── Config file first (so command-line flags can override it) ──
+ARGS=("$@")
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+  if [[ "${ARGS[$i]}" == "--config" ]]; then
+    CONFIG_FILE="${ARGS[$((i + 1))]:-}"
+    [[ -f "$CONFIG_FILE" ]] || error "Config file not found: ${CONFIG_FILE}"
+    set -a
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    set +a
+  fi
+done
+
 # ── Parse arguments ──
 SCOPE=""
-SSH_USER="ec2-user"
-SSH_KEY="$HOME/.ssh/id_rsa"
+SSH_USER="${SSH_USER:-ec2-user}"
+SSH_KEY="${SSH_KEY:-}"
+SSH_PORT="${SSH_PORT:-22}"
+ASSUME_YES=false
+CLUSTER_NAME="${CLUSTER_NAME:-cassandra-cluster}"
+NAMESPACE="${NAMESPACE:-k8ssandra-operator}"
+CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.21.3}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --scope)    SCOPE="$2";    shift 2 ;;
+    --config)   shift 2 ;;
     --ssh-user) SSH_USER="$2"; shift 2 ;;
     --ssh-key)  SSH_KEY="$2";  shift 2 ;;
+    --ssh-port) SSH_PORT="$2"; shift 2 ;;
+    --cluster-name) CLUSTER_NAME="$2"; shift 2 ;;
+    --namespace)    NAMESPACE="$2";    shift 2 ;;
+    --yes|-y)   ASSUME_YES=true; shift ;;
     *) error "Unknown argument: $1" ;;
   esac
 done
 
-[[ -z "$SCOPE" ]] && error "Missing --scope. Use: --scope k8ssandra  OR  --scope full"
-[[ "$SCOPE" != "k8ssandra" && "$SCOPE" != "full" ]] && \
-  error "--scope must be 'k8ssandra' or 'full'"
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=15 -p "$SSH_PORT")
+[[ -n "$SSH_KEY" ]] && SSH_OPTS+=(-i "$SSH_KEY")
+
+[[ -z "$SCOPE" ]] && error "Missing --scope. Use: k8ssandra | full | monitoring,medusa,seaweedfs"
+if [[ "$SCOPE" != "k8ssandra" && "$SCOPE" != "full" ]]; then
+  for S in ${SCOPE//,/ }; do
+    [[ "$S" =~ ^(monitoring|medusa|seaweedfs)$ ]] || \
+      error "Unknown scope '$S'. Use k8ssandra or full alone, or any of: monitoring,medusa,seaweedfs"
+  done
+fi
+has_scope() { [[ ",${SCOPE}," == *",$1,"* ]]; }
 
 # ── Must run as root ──
 [[ "$EUID" -ne 0 ]] && error "Please run with sudo or as root."
@@ -56,6 +112,34 @@ done
 # ── Ensure kubectl, helm, and other tools are on PATH ──
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin:$PATH"
 export KUBECONFIG=/etc/kubernetes/admin.conf
+
+# ── Full teardown: prove SSH + sudo to every worker before touching anything ──
+if [[ "$SCOPE" == "full" ]]; then
+  [[ -z "$SSH_KEY" || -r "$SSH_KEY" ]] || error "SSH key not readable: ${SSH_KEY}"
+  mapfile -t PRE_IPS < <(kubectl get nodes --selector='!node-role.kubernetes.io/control-plane' \
+    -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' 2>/dev/null | sed '/^$/d' || true)
+  if [[ ${#PRE_IPS[@]} -gt 0 ]]; then
+    info "Checking SSH to ${#PRE_IPS[@]} worker(s) as '${SSH_USER}'${SSH_KEY:+ with key ${SSH_KEY}}..."
+    SSH_FAILED=0
+    for IP in "${PRE_IPS[@]}"; do
+      if ssh "${SSH_OPTS[@]}" "${SSH_USER}@${IP}" 'sudo -n true' > /dev/null 2>&1; then
+        success "  ${IP}: SSH + sudo OK"
+      else
+        warn "  ${IP}: SSH or passwordless sudo FAILED"
+        SSH_FAILED=1
+      fi
+    done
+    if [[ "$SSH_FAILED" -ne 0 ]]; then
+      error "Nothing was removed. Pass the right user/key, e.g. --config cluster.env, or --ssh-user automaton --ssh-key /home/automaton/.ssh/id_ed25519"
+    fi
+  fi
+fi
+
+if [[ "$SCOPE" == "full" && "$ASSUME_YES" != "true" ]]; then
+  echo -e "${RED}This DESTROYS the whole cluster: all Cassandra data and Kubernetes on every node.${NC}"
+  read -rp "Type 'destroy' to continue: " CONFIRM
+  [[ "$CONFIRM" == "destroy" ]] || error "Aborted."
+fi
 
 echo ""
 echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
@@ -80,6 +164,15 @@ cleanup_k8ssandra() {
   kubectl delete secret medusa-bucket-key -n "$NAMESPACE" --ignore-not-found || true
   success "Medusa secret removed."
 
+  # ── Remove SeaweedFS (addon) — deletes its PVC, i.e. the stored backups ──
+  if helm status seaweedfs -n seaweedfs &>/dev/null; then
+    info "Uninstalling SeaweedFS (backup storage)..."
+    helm uninstall seaweedfs -n seaweedfs > /dev/null 2>&1 || true
+    kubectl delete namespace seaweedfs --ignore-not-found --timeout=120s || true
+    success "SeaweedFS removed."
+  fi
+  helm repo remove seaweedfs 2>/dev/null || true
+
   # ── Remove prometheus-community Helm repo ──
   helm repo remove prometheus-community 2>/dev/null || true
 
@@ -99,7 +192,7 @@ cleanup_k8ssandra() {
   # ── Delete cert-manager ──
   info "Deleting cert-manager..."
   kubectl delete -f \
-    "https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml" \
+    "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml" \
     --ignore-not-found 2>/dev/null || true
   kubectl delete namespace cert-manager --ignore-not-found --timeout=60s || true
   success "cert-manager removed."
@@ -143,10 +236,7 @@ reset_worker_via_ssh() {
   success "Node '${NODE_NAME}' drained."
 
   info "Resetting worker '${NODE_NAME}' via SSH..."
-  ssh -i "${SSH_KEY}" \
-      -o StrictHostKeyChecking=no \
-      -o BatchMode=yes \
-      -o ConnectTimeout=15 \
+  ssh "${SSH_OPTS[@]}" \
       "${SSH_USER}@${NODE_IP}" \
       "sudo bash -s" <<'REMOTE'
 set -e
@@ -159,7 +249,7 @@ iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X || tru
 ipvsadm --clear 2>/dev/null || true
 
 echo "[WORKER] Removing kubeconfig..."
-rm -rf /root/.kube /home/ec2-user/.kube /home/ubuntu/.kube 2>/dev/null || true
+rm -rf /root/.kube /home/*/.kube 2>/dev/null || true
 
 echo "[WORKER] Detecting OS..."
 if [[ -f /etc/os-release ]]; then . /etc/os-release; OS=$ID; fi
@@ -206,7 +296,7 @@ reset_control_plane_locally() {
   rm -rf /etc/cni/net.d
   iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X || true
   ipvsadm --clear 2>/dev/null || true
-  rm -rf /root/.kube /home/ec2-user/.kube /home/ubuntu/.kube 2>/dev/null || true
+  rm -rf /root/.kube /home/*/.kube 2>/dev/null || true
 
   if [[ "$OS" == "amzn" ]]; then
     yum remove -y kubelet kubeadm kubectl --disableexcludes=kubernetes 2>/dev/null || true
@@ -254,7 +344,7 @@ cleanup_full() {
   if [[ ${#WORKER_NAMES[@]} -eq 0 ]]; then
     warn "No worker nodes found — skipping worker reset."
   else
-    info "Resetting ${#WORKER_NAMES[@]} worker(s) via SSH (user: ${SSH_USER}, key: ${SSH_KEY})..."
+    info "Resetting ${#WORKER_NAMES[@]} worker(s) via SSH (user: ${SSH_USER}, key: ${SSH_KEY:-ssh default})..."
     for NODE in "${WORKER_NAMES[@]}"; do
       [[ -z "$NODE" ]] && continue
       reset_worker_via_ssh "$NODE" "${WORKER_IPS[$NODE]}"
@@ -272,9 +362,75 @@ cleanup_full() {
   echo ""
 }
 
+# ════════════════════════════════════════════════════════════
+# COMPONENT SCOPES — monitoring, medusa, seaweedfs
+# ════════════════════════════════════════════════════════════
+cleanup_monitoring() {
+  info "Removing Prometheus + Grafana..."
+  if helm status prometheus-grafana -n "$NAMESPACE" &>/dev/null; then
+    helm uninstall prometheus-grafana -n "$NAMESPACE" > /dev/null
+    success "Helm release prometheus-grafana removed."
+  else
+    warn "prometheus-grafana is not installed — skipping."
+  fi
+  kubectl delete configmap -n "$NAMESPACE" -l grafana_dashboard=1 --ignore-not-found > /dev/null || true
+  kubectl delete secret prometheus-grafana -n "$NAMESPACE" --ignore-not-found > /dev/null || true
+  helm repo remove prometheus-community &>/dev/null || true
+  success "Monitoring removed. (Prometheus CRDs are left in place; Cassandra keeps running.)"
+}
+
+medusa_configured() {
+  kubectl get k8ssandracluster "$CLUSTER_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.medusa}' 2>/dev/null | grep -q .
+}
+
+cleanup_medusa() {
+  info "Removing Medusa from K8ssandraCluster '${CLUSTER_NAME}'..."
+  kubectl delete medusabackupschedule --all -n "$NAMESPACE" --ignore-not-found > /dev/null 2>&1 || true
+  success "Backup schedules removed."
+  if medusa_configured; then
+    kubectl patch k8ssandracluster "$CLUSTER_NAME" -n "$NAMESPACE" --type=json \
+      -p '[{"op": "remove", "path": "/spec/medusa"}]' > /dev/null
+    success "Medusa removed from the cluster spec — Cassandra pods now restart one at a time without it."
+  else
+    warn "Medusa is not configured on ${CLUSTER_NAME} — nothing to patch."
+  fi
+  kubectl delete medusabackupjob --all -n "$NAMESPACE" --ignore-not-found > /dev/null 2>&1 || true
+  kubectl delete secret medusa-bucket-key -n "$NAMESPACE" --ignore-not-found > /dev/null || true
+  info "Backup data in the bucket was NOT deleted. MedusaBackup records are kept: kubectl get medusabackup -n ${NAMESPACE}"
+  info "Watch the restart: kubectl get pods -n ${NAMESPACE} -w   (pods go back to 2/2)"
+}
+
+cleanup_seaweedfs() {
+  if medusa_configured && kubectl get k8ssandracluster "$CLUSTER_NAME" -n "$NAMESPACE" \
+       -o jsonpath='{.spec.medusa.storageProperties.host}' 2>/dev/null | grep -q seaweedfs; then
+    error "Medusa still uses SeaweedFS for backups. Remove both together: --scope medusa,seaweedfs"
+  fi
+  if ! helm status seaweedfs -n seaweedfs &>/dev/null && ! kubectl get namespace seaweedfs &>/dev/null; then
+    warn "SeaweedFS is not installed — skipping."
+    return 0
+  fi
+  if [[ "$ASSUME_YES" != "true" ]]; then
+    echo -e "${RED}This deletes SeaweedFS and ALL backups stored in it.${NC}"
+    read -rp "Type 'delete' to continue: " CONFIRM
+    [[ "$CONFIRM" == "delete" ]] || error "Aborted — SeaweedFS left in place."
+  fi
+  info "Removing SeaweedFS..."
+  helm uninstall seaweedfs -n seaweedfs > /dev/null 2>&1 || true
+  kubectl delete namespace seaweedfs --ignore-not-found --timeout=180s > /dev/null || true
+  helm repo remove seaweedfs &>/dev/null || true
+  success "SeaweedFS and its volume removed."
+}
+
 # ── Run ──
 if [[ "$SCOPE" == "k8ssandra" ]]; then
   cleanup_k8ssandra
 elif [[ "$SCOPE" == "full" ]]; then
   cleanup_full
+else
+  # fixed order: monitoring, then medusa (so it stops using the storage), then seaweedfs
+  if has_scope monitoring; then cleanup_monitoring; fi
+  if has_scope medusa;     then cleanup_medusa; fi
+  if has_scope seaweedfs;  then cleanup_seaweedfs; fi
+  echo ""
+  success "Cleanup of '${SCOPE}' finished. Kubernetes and Cassandra are still running."
 fi

@@ -31,3 +31,6 @@ Thumbs.db
 # Logs
 *.log
 kubeadm-init.log
+
+# Local cluster settings (may contain Medusa keys)
+config/cluster.env

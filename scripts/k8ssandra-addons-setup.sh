@@ -20,9 +20,19 @@
 #   --reaper               Enable Reaper only
 #   --medusa               Enable Medusa only
 #   --medusa-bucket        S3 bucket name for Medusa (required for --medusa)
-#   --medusa-access-key    AWS access key for S3
-#   --medusa-secret-key    AWS secret key for S3
 #   --medusa-region        AWS S3 region (default: us-east-1)
+#   --medusa-credentials-type credential-based (default) | role-based
+#   --medusa-access-key    AWS access key (prefer env var MEDUSA_ACCESS_KEY)
+#   --medusa-secret-key    AWS secret key (prefer env var MEDUSA_SECRET_KEY)
+#
+# Medusa settings can also come from environment variables, which keeps secrets
+# out of the process list and shell history:
+#   MEDUSA_BUCKET, MEDUSA_REGION, MEDUSA_CREDENTIALS_TYPE,
+#   MEDUSA_ACCESS_KEY, MEDUSA_SECRET_KEY,
+#   MEDUSA_BACKUP_SCHEDULE   cron for automatic daily backups, e.g. "0 1 * * *"
+#   GRAFANA_ADMIN_PASSWORD   Grafana admin password (default: random, kept on re-runs)
+# role-based uses the node's IAM instance profile (needs IMDS hop limit >= 2)
+# or IRSA on EKS — no keys stored in the cluster.
 #   --cluster-name         K8ssandraCluster name (default: cassandra-cluster)
 #   --namespace            Namespace (default: k8ssandra-operator)
 #
@@ -33,16 +43,18 @@
 #   # Monitoring only
 #   sudo bash k8ssandra-addons-setup.sh --monitoring
 #
-#   # Reaper + Medusa with S3
-#   sudo bash k8ssandra-addons-setup.sh --reaper --medusa \
-#     --medusa-bucket my-cassandra-backups \
-#     --medusa-access-key AKIAIOSFODNN7EXAMPLE \
-#     --medusa-secret-key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
-#     --medusa-region us-east-1
+#   # Reaper + Medusa with S3 (keys via environment, not flags)
+#   export MEDUSA_ACCESS_KEY=... MEDUSA_SECRET_KEY=...
+#   bash k8ssandra-addons-setup.sh --reaper --medusa \
+#     --medusa-bucket my-cassandra-backups --medusa-region us-east-1
+#
+#   # Medusa with the instance's IAM role, no keys at all
+#   bash k8ssandra-addons-setup.sh --medusa --medusa-bucket my-cassandra-backups \
+#     --medusa-credentials-type role-based
 # ============================================================
 
 set -euo pipefail
-export KUBECONFIG=/etc/kubernetes/admin.conf
+export KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
@@ -59,10 +71,11 @@ INSTALL_REAPER=false
 INSTALL_MEDUSA=false
 CLUSTER_NAME="cassandra-cluster"
 NAMESPACE="k8ssandra-operator"
-MEDUSA_BUCKET=""
-MEDUSA_ACCESS_KEY=""
-MEDUSA_SECRET_KEY=""
-MEDUSA_REGION="us-east-1"
+MEDUSA_BUCKET="${MEDUSA_BUCKET:-}"
+MEDUSA_ACCESS_KEY="${MEDUSA_ACCESS_KEY:-}"
+MEDUSA_SECRET_KEY="${MEDUSA_SECRET_KEY:-}"
+MEDUSA_REGION="${MEDUSA_REGION:-us-east-1}"
+MEDUSA_CREDENTIALS_TYPE="${MEDUSA_CREDENTIALS_TYPE:-credential-based}"
 INSTALL_ALL=false
 
 # ── Argument parsing ──────────────────────────────────────────
@@ -78,6 +91,7 @@ while [[ $# -gt 0 ]]; do
     --medusa-access-key)  MEDUSA_ACCESS_KEY="$2";    shift 2 ;;
     --medusa-secret-key)  MEDUSA_SECRET_KEY="$2";    shift 2 ;;
     --medusa-region)      MEDUSA_REGION="$2";        shift 2 ;;
+    --medusa-credentials-type) MEDUSA_CREDENTIALS_TYPE="$2"; shift 2 ;;
     --cluster-name)       CLUSTER_NAME="$2";         shift 2 ;;
     --namespace)          NAMESPACE="$2";             shift 2 ;;
     *) error "Unknown argument: $1" ;;
@@ -91,19 +105,23 @@ if [[ "$INSTALL_ALL" == "true" ]]; then
 fi
 
 # ── Prompt for Medusa S3 details if missing ────────────────────
+# Prompts only when a human is at the terminal; unattended runs fail fast instead of hanging.
 if [[ "$INSTALL_MEDUSA" == "true" ]]; then
+  [[ "$MEDUSA_CREDENTIALS_TYPE" =~ ^(credential-based|role-based)$ ]] || \
+    error "--medusa-credentials-type must be credential-based or role-based."
+  ask() { [[ -t 0 ]] || error "$1 is not set (set it via environment/config — running non-interactively)."; }
   if [[ -z "$MEDUSA_BUCKET" ]]; then
-    read -rp "Enter S3 bucket name for Medusa backups: " MEDUSA_BUCKET
+    ask MEDUSA_BUCKET; read -rp "Enter S3 bucket name for Medusa backups: " MEDUSA_BUCKET
   fi
-  if [[ -z "$MEDUSA_ACCESS_KEY" ]]; then
-    read -rp "Enter AWS access key ID: " MEDUSA_ACCESS_KEY
-  fi
-  if [[ -z "$MEDUSA_SECRET_KEY" ]]; then
-    read -rsp "Enter AWS secret access key: " MEDUSA_SECRET_KEY; echo ""
+  if [[ "$MEDUSA_CREDENTIALS_TYPE" == "credential-based" ]]; then
+    if [[ -z "$MEDUSA_ACCESS_KEY" ]]; then
+      ask MEDUSA_ACCESS_KEY; read -rp "Enter AWS access key ID: " MEDUSA_ACCESS_KEY
+    fi
+    if [[ -z "$MEDUSA_SECRET_KEY" ]]; then
+      ask MEDUSA_SECRET_KEY; read -rsp "Enter AWS secret access key: " MEDUSA_SECRET_KEY; echo ""
+    fi
   fi
 fi
-
-[[ "$EUID" -ne 0 ]] && error "Run with sudo or as root."
 which kubectl &>/dev/null || error "kubectl not found."
 which helm &>/dev/null    || error "helm not found. Install helm first."
 
@@ -125,6 +143,12 @@ install_monitoring() {
   helm repo update > /dev/null
   success "Helm repo added."
 
+  # ── Grafana admin password: keep the existing one, else $GRAFANA_ADMIN_PASSWORD, else random ──
+  local grafana_pw
+  grafana_pw=$(kubectl get secret prometheus-grafana -n "$NAMESPACE" -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  [[ -z "$grafana_pw" ]] && grafana_pw="${GRAFANA_ADMIN_PASSWORD:-$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20)}"
+  ( umask 077; printf 'grafana:\n  adminPassword: "%s"\n' "$grafana_pw" > /tmp/kube-prom-stack-secret-values.yaml )
+
   # ── Write values file ──
   info "Writing kube-prometheus-stack values..."
   cat > /tmp/kube-prom-stack-values.yaml <<'EOF'
@@ -145,7 +169,6 @@ prometheus:
 grafana:
   enabled: true
   adminUser: admin
-  adminPassword: K8ssandraAdmin!
   defaultDashboardsEnabled: false
   plugins:
     - grafana-polystat-panel
@@ -168,21 +191,22 @@ EOF
     helm upgrade prometheus-grafana \
       prometheus-community/kube-prometheus-stack \
       -n "$NAMESPACE" \
-      -f /tmp/kube-prom-stack-values.yaml \
+      -f /tmp/kube-prom-stack-values.yaml -f /tmp/kube-prom-stack-secret-values.yaml \
       --wait --timeout 5m
   else
     helm install prometheus-grafana \
       prometheus-community/kube-prometheus-stack \
       -n "$NAMESPACE" \
-      -f /tmp/kube-prom-stack-values.yaml \
+      -f /tmp/kube-prom-stack-values.yaml -f /tmp/kube-prom-stack-secret-values.yaml \
       --wait --timeout 5m
   fi
+  rm -f /tmp/kube-prom-stack-secret-values.yaml
   success "Prometheus + Grafana installed."
 
   # ── Install Grafana dashboards for Cassandra ──
   info "Installing Cassandra Grafana dashboards..."
   curl -fsSL \
-    "https://raw.githubusercontent.com/k8ssandra/k8ssandra-operator/main/docs/content/en/tasks/monitor/prometheus-grafana/grafana-dashboards.yaml" \
+    "https://raw.githubusercontent.com/k8ssandra/k8ssandra-operator/${K8SSANDRA_DOCS_REF:-v1.33.0}/docs/content/en/tasks/monitor/prometheus-grafana/grafana-dashboards.yaml" \
     -o /tmp/grafana-dashboards.yaml 2>/dev/null || \
     warn "Could not download dashboard configmaps — apply manually from K8ssandra docs."
 
@@ -198,7 +222,7 @@ EOF
   success "Monitoring deployed!"
   echo -e "${YELLOW}  Grafana URL    :${NC} http://${NODE_IP}:32000"
   echo -e "${YELLOW}  Grafana user   :${NC} admin"
-  echo -e "${YELLOW}  Grafana pass   :${NC} K8ssandraAdmin!"
+  echo -e "${YELLOW}  Grafana pass   :${NC} kubectl get secret prometheus-grafana -n ${NAMESPACE} -o jsonpath='{.data.admin-password}' | base64 -d; echo"
   echo -e "${YELLOW}  Port-forward   :${NC} kubectl port-forward svc/prometheus-grafana 3000:80 -n ${NAMESPACE}"
   echo ""
 }
@@ -228,9 +252,9 @@ patch_k8ssandra_cluster() {
     kubectl patch k8ssandracluster "$CLUSTER_NAME" \
       -n "$NAMESPACE" \
       --type=merge \
-      -p "{\"spec\":{\"cassandra\":{${TELEMETRY_PATCH}}}}" || \
-      warn "Could not patch telemetry — you may need to apply manually."
-    success "Cassandra telemetry patched."
+      -p "{\"spec\":{\"cassandra\":{${TELEMETRY_PATCH}}}}" \
+      && success "Cassandra telemetry patched." \
+      || warn "Could not patch telemetry — you may need to apply manually."
   fi
 
   # Patch reaper into the cluster spec
@@ -238,9 +262,9 @@ patch_k8ssandra_cluster() {
     kubectl patch k8ssandracluster "$CLUSTER_NAME" \
       -n "$NAMESPACE" \
       --type=merge \
-      -p "{\"spec\":{${REAPER_PATCH}}}" || \
-      warn "Could not patch Reaper — you may need to apply manually (see output below)."
-    success "Reaper added to K8ssandraCluster."
+      -p "{\"spec\":{${REAPER_PATCH}}}" \
+      && success "Reaper added to K8ssandraCluster." \
+      || warn "Could not patch Reaper — you may need to apply manually (see output below)."
   fi
 }
 
@@ -256,7 +280,7 @@ setup_reaper() {
 
   # ── Wait for at least one Reaper pod to be Running ──
   info "Waiting for Reaper pod(s) to be Running (up to 3 min)..."
-  for i in {1..18}; do
+  for _ in {1..18}; do
     REAPER_POD=$(kubectl get pods -n "$NAMESPACE" \
       --selector=app.kubernetes.io/component=reaper \
       -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -278,6 +302,8 @@ setup_reaper() {
 
   # ── Get Reaper credentials (shared across all DCs) ──
   REAPER_SECRET="${CLUSTER_NAME}-reaper-ui"
+  REAPER_USER=$(kubectl get secret "$REAPER_SECRET" -n "$NAMESPACE" \
+    -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || echo "check-secret-manually")
   REAPER_PASS=$(kubectl get secret "$REAPER_SECRET" -n "$NAMESPACE" \
     -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "check-secret-manually")
 
@@ -294,13 +320,13 @@ setup_reaper() {
   for DC in "${DC_NAMES[@]}"; do
     REAPER_SVC="${CLUSTER_NAME}-${DC}-reaper-service"
     NODEPORT=$((BASE_NODEPORT + DC_INDEX * 10))
-    NODEPORT_ADMIN=$((NODEPORT + 1))
+    NODEPORT_SVC="${CLUSTER_NAME}-${DC}-reaper-nodeport"
 
-    info "Patching Reaper service for ${DC}: '${REAPER_SVC}' → NodePort ${NODEPORT}..."
+    info "Exposing Reaper for ${DC} on NodePort ${NODEPORT} (service '${NODEPORT_SVC}')..."
 
     # Wait up to 2 min for the service to exist
     SVC_FOUND=false
-    for i in {1..12}; do
+    for _ in {1..12}; do
       if kubectl get svc "$REAPER_SVC" -n "$NAMESPACE" &>/dev/null; then
         SVC_FOUND=true
         break
@@ -315,29 +341,44 @@ setup_reaper() {
       continue
     fi
 
-    # Patch type + NodePorts; fall back to simple merge patch
-    kubectl patch svc "$REAPER_SVC" \
-      -n "$NAMESPACE" \
-      --type=json \
-      -p="[
-        {\"op\": \"replace\", \"path\": \"/spec/type\",             \"value\": \"NodePort\"},
-        {\"op\": \"replace\", \"path\": \"/spec/ports/0/nodePort\", \"value\": ${NODEPORT}},
-        {\"op\": \"replace\", \"path\": \"/spec/ports/1/nodePort\", \"value\": ${NODEPORT_ADMIN}}
-      ]" 2>/dev/null || \
-    kubectl patch svc "$REAPER_SVC" \
-      -n "$NAMESPACE" \
-      --type=merge \
-      -p '{"spec": {"type": "NodePort"}}' || \
-      warn "Could not patch ${REAPER_SVC} — patch manually: kubectl patch svc ${REAPER_SVC} -n ${NAMESPACE} --type=merge -p '{\"spec\":{\"type\":\"NodePort\"}}'"
-
-    success "Reaper service for ${DC} patched to NodePort ${NODEPORT}."
-    echo -e "${YELLOW}  ${DC} Web UI :${NC} http://${NODE_IP}:${NODEPORT}/webui"
+    # The operator's Reaper service exposes one port (8080, "app") and is reconciled by the
+    # operator, so instead of patching it we create our own NodePort service with the same
+    # pod selector. The operator never touches it, so the port stays fixed.
+    SELECTOR=$(kubectl get svc "$REAPER_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.selector}')
+    TARGET_PORT=$(kubectl get svc "$REAPER_SVC" -n "$NAMESPACE" -o jsonpath='{.spec.ports[0].targetPort}')
+    [[ "$TARGET_PORT" =~ ^[0-9]+$ ]] || TARGET_PORT="\"${TARGET_PORT:-app}\""
+    if [[ -z "$SELECTOR" ]]; then
+      warn "Could not read the selector of ${REAPER_SVC} — skipping ${DC}."
+      DC_INDEX=$((DC_INDEX + 1))
+      continue
+    fi
+    if kubectl apply -n "$NAMESPACE" -f - > /dev/null <<EOF_SVC
+{
+  "apiVersion": "v1",
+  "kind": "Service",
+  "metadata": {
+    "name": "${NODEPORT_SVC}",
+    "labels": {"app.kubernetes.io/managed-by": "k8ssandra-addons-setup", "k8ssandra.io/cluster-name": "${CLUSTER_NAME}"}
+  },
+  "spec": {
+    "type": "NodePort",
+    "selector": ${SELECTOR},
+    "ports": [{"name": "app", "port": 8080, "targetPort": ${TARGET_PORT}, "nodePort": ${NODEPORT}, "protocol": "TCP"}]
+  }
+}
+EOF_SVC
+    then
+      success "Reaper for ${DC} exposed on NodePort ${NODEPORT}."
+      echo -e "${YELLOW}  ${DC} Web UI :${NC} http://${NODE_IP}:${NODEPORT}/webui"
+    else
+      warn "Could not create ${NODEPORT_SVC} (is port ${NODEPORT} already used?). Use: kubectl port-forward svc/${REAPER_SVC} 8080:8080 -n ${NAMESPACE}"
+    fi
 
     DC_INDEX=$((DC_INDEX + 1))
   done
 
   echo ""
-  echo -e "${YELLOW}  Username   :${NC} ${CLUSTER_NAME}-reaper-ui"
+  echo -e "${YELLOW}  Username   :${NC} ${REAPER_USER}"
   echo -e "${YELLOW}  Password   :${NC} ${REAPER_PASS}"
   echo -e "${YELLOW}  Get secret :${NC} kubectl get secret ${REAPER_SECRET} -n ${NAMESPACE} -o jsonpath='{.data.password}' | base64 -d"
   echo ""
@@ -349,15 +390,20 @@ setup_reaper() {
 install_medusa() {
   header "COMPONENT 4: Medusa — Backup and Restore (S3)"
 
-  # ── Create S3 credentials secret ──
-  info "Creating Medusa S3 credentials secret..."
-  kubectl create secret generic medusa-bucket-key \
-    -n "$NAMESPACE" \
-    --from-literal=credentials="[default]
-aws_access_key_id = ${MEDUSA_ACCESS_KEY}
-aws_secret_access_key = ${MEDUSA_SECRET_KEY}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-  success "Medusa credentials secret created/updated."
+  local secret_ref='{"name": "medusa-bucket-key"}'
+  if [[ "$MEDUSA_CREDENTIALS_TYPE" == "role-based" ]]; then
+    info "Using role-based credentials (IAM instance profile / IRSA) — no secret created."
+    secret_ref='{"name": ""}'
+  else
+    # ── Create S3 credentials secret (keys piped via stdin, never on a command line) ──
+    info "Creating Medusa S3 credentials secret..."
+    printf '[default]\naws_access_key_id = %s\naws_secret_access_key = %s\n' \
+      "$MEDUSA_ACCESS_KEY" "$MEDUSA_SECRET_KEY" \
+      | kubectl create secret generic medusa-bucket-key -n "$NAMESPACE" \
+          --from-file=credentials=/dev/stdin --dry-run=client -o yaml \
+      | kubectl apply -f - > /dev/null
+    success "Medusa credentials secret created/updated."
+  fi
 
   # ── Patch K8ssandraCluster with Medusa config ──
   info "Adding Medusa to K8ssandraCluster spec..."
@@ -369,7 +415,8 @@ aws_secret_access_key = ${MEDUSA_SECRET_KEY}" \
         \"medusa\": {
           \"storageProperties\": {
             \"storageProvider\": \"s3\",
-            \"storageSecretRef\": {\"name\": \"medusa-bucket-key\"},
+            \"credentialsType\": \"${MEDUSA_CREDENTIALS_TYPE}\",
+            \"storageSecretRef\": ${secret_ref},
             \"bucketName\": \"${MEDUSA_BUCKET}\",
             \"prefix\": \"${CLUSTER_NAME}\",
             \"region\": \"${MEDUSA_REGION}\",
@@ -388,23 +435,43 @@ aws_secret_access_key = ${MEDUSA_SECRET_KEY}" \
   echo -e "${YELLOW}  Storage        :${NC} S3 (${MEDUSA_REGION})"
   echo -e "${YELLOW}  Bucket         :${NC} ${MEDUSA_BUCKET}"
   echo -e "${YELLOW}  Prefix         :${NC} ${CLUSTER_NAME}"
+  info "Note: adding Medusa rolling-restarts the Cassandra pods (a medusa container is added to each)."
+
+  # ── Optional: scheduled backups (one MedusaBackupSchedule per DC) ──
+  if [[ -n "${MEDUSA_BACKUP_SCHEDULE:-}" ]]; then
+    local dc
+    for dc in $(kubectl get k8ssandracluster "$CLUSTER_NAME" -n "$NAMESPACE" \
+                  -o jsonpath='{range .spec.cassandra.datacenters[*]}{.metadata.name}{" "}{end}'); do
+      kubectl apply -n "$NAMESPACE" -f - > /dev/null <<EOF_SCHED
+apiVersion: medusa.k8ssandra.io/v1alpha1
+kind: MedusaBackupSchedule
+metadata:
+  name: ${CLUSTER_NAME}-${dc}-backup-schedule
+spec:
+  cronSchedule: "${MEDUSA_BACKUP_SCHEDULE}"
+  backupSpec:
+    cassandraDatacenter: ${dc}
+    backupType: differential
+EOF_SCHED
+      success "Backup schedule for ${dc}: '${MEDUSA_BACKUP_SCHEDULE}' (differential)."
+    done
+  fi
+
   echo ""
-  echo -e "${YELLOW}  Take a backup  :${NC}"
-  echo -e "    kubectl apply -f - <<EOF"
+  echo -e "${YELLOW}  Take a backup now (per DC):${NC}"
+  echo -e "    kubectl apply -n ${NAMESPACE} -f - <<EOF"
   echo -e "    apiVersion: medusa.k8ssandra.io/v1alpha1"
-  echo -e "    kind: CassandraBackup"
+  echo -e "    kind: MedusaBackupJob"
   echo -e "    metadata:"
-  echo -e "      name: backup-\$(date +%Y%m%d)"
-  echo -e "      namespace: ${NAMESPACE}"
+  echo -e "      name: backup-\$(date +%Y%m%d-%H%M)"
   echo -e "    spec:"
-  echo -e "      name: backup-\$(date +%Y%m%d)"
-  echo -e "      k8ssandraClusterRef:"
-  echo -e "        name: ${CLUSTER_NAME}"
-  echo -e "        namespace: ${NAMESPACE}"
+  echo -e "      cassandraDatacenter: dc1"
   echo -e "    EOF"
   echo ""
-  echo -e "${YELLOW}  List backups   :${NC} kubectl get cassandrabackup -n ${NAMESPACE}"
-  echo -e "${YELLOW}  List restores  :${NC} kubectl get cassandrarestore -n ${NAMESPACE}"
+  echo -e "${YELLOW}  Backup jobs    :${NC} kubectl get medusabackupjob -n ${NAMESPACE}"
+  echo -e "${YELLOW}  Backups        :${NC} kubectl get medusabackup -n ${NAMESPACE}"
+  echo -e "${YELLOW}  Restore        :${NC} create a MedusaRestoreJob (spec.cassandraDatacenter + spec.backup: <backup name>)"
+  echo -e "${YELLOW}  Schedules      :${NC} kubectl get medusabackupschedule -n ${NAMESPACE}"
   echo ""
 }
 

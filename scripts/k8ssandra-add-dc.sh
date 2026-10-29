@@ -13,12 +13,23 @@
 #   sudo bash scripts/k8ssandra-add-dc.sh \
 #     --dc-name dc2 \
 #     --dc-size 3 \
-#     --storage 20Gi
+#     --storage 20Gi \
+#     --replication '{"my_keyspace": 3, "other_ks": 3}'
 #
 # Defaults (if not provided):
-#   --dc-name   dc2
-#   --dc-size   3
-#   --storage   20Gi
+#   --dc-name        dc2
+#   --dc-size        3
+#   --storage        20Gi
+#   --storage-class  same as the first existing DC
+#   --heap-size      same as the first existing DC (else 2048M)
+#   --replication    none -- only system/K8ssandra keyspaces get replicas in the new
+#                    DC. To copy YOUR keyspaces, list ALL of them with a replica
+#                    count (0 = no replicas); the operator then alters replication
+#                    and rebuilds the new DC (k8ssandra.io/dc-replication annotation).
+#   --cluster-name   cassandra-cluster      --namespace  k8ssandra-operator
+#
+# Need more nodes first? From the control plane:
+#   sudo bash scripts/k8s-k8ssandra-setup.sh --role add-workers --workers IP1,IP2,IP3 --ssh-key KEY
 # ============================================================
 
 set -euo pipefail
@@ -34,6 +45,9 @@ error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 DC_NAME="dc2"
 DC_SIZE=3
 STORAGE="20Gi"
+STORAGE_CLASS=""
+HEAP_SIZE=""
+REPLICATION=""
 NAMESPACE="k8ssandra-operator"
 CLUSTER_NAME="cassandra-cluster"
 
@@ -43,14 +57,24 @@ while [[ $# -gt 0 ]]; do
     --dc-name)  DC_NAME="$2";  shift 2 ;;
     --dc-size)  DC_SIZE="$2";  shift 2 ;;
     --storage)  STORAGE="$2";  shift 2 ;;
+    --storage-class) STORAGE_CLASS="$2"; shift 2 ;;
+    --heap-size)     HEAP_SIZE="$2";     shift 2 ;;
+    --replication)   REPLICATION="$2";   shift 2 ;;
+    --cluster-name)  CLUSTER_NAME="$2";  shift 2 ;;
+    --namespace)     NAMESPACE="$2";     shift 2 ;;
     *) error "Unknown argument: $1" ;;
   esac
 done
 
-# ── Must run as root ──
-[[ "$EUID" -ne 0 ]] && error "Please run with sudo or as root."
+[[ "$DC_SIZE" =~ ^[1-9][0-9]*$ ]] || error "--dc-size must be a positive integer."
+[[ "$DC_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || error "--dc-name must be lowercase letters, digits and '-'."
+if [[ -n "$REPLICATION" ]]; then
+  command -v python3 > /dev/null || error "--replication needs python3 to validate the JSON."
+  python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert isinstance(d,dict) and d and all(type(v) is int and v>=0 for v in d.values())' "$REPLICATION" 2>/dev/null \
+    || error "--replication must be a JSON object of keyspace -> replica count, e.g. '{\"ks1\": 3}'"
+fi
 
-export KUBECONFIG=/etc/kubernetes/admin.conf
+export KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}"
 
 echo ""
 echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
@@ -74,13 +98,50 @@ EXISTING=$(kubectl get k8ssandracluster "${CLUSTER_NAME}" -n "${NAMESPACE}" \
 [[ -n "$EXISTING" ]] && error "Datacenter '${DC_NAME}' already exists in cluster '${CLUSTER_NAME}'."
 success "DC name '${DC_NAME}' is available."
 
-# ── Check enough Ready worker nodes are available ──
-info "Checking Ready nodes..."
-READY_NODES=$(kubectl get nodes --no-headers | grep -c ' Ready' || true)
-info "Ready nodes: ${READY_NODES}"
-if [[ "$READY_NODES" -lt "$DC_SIZE" ]]; then
-  warn "Only ${READY_NODES} Ready node(s) found but DC size is ${DC_SIZE}."
-  warn "Pods may stay Pending until more nodes join."
+# ── Check enough FREE schedulable nodes exist (Ready, no NoSchedule taint, no Cassandra pod yet) ──
+info "Checking free schedulable nodes..."
+BUSY=$(kubectl get pods -A -l app.kubernetes.io/name=cassandra \
+  -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sed '/^$/d' | sort -u)
+FREE_NODES=0
+while read -r NODE READY TAINTS; do
+  [[ "$READY" != "True" || "${TAINTS:-}" == *NoSchedule* ]] && continue
+  grep -qx "$NODE" <<< "$BUSY" && continue
+  FREE_NODES=$((FREE_NODES + 1))
+done < <(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.conditions[?(@.type=="Ready")].status}{" "}{.spec.taints[*].effect}{"\n"}{end}')
+info "Free nodes for the new DC: ${FREE_NODES} (need ${DC_SIZE})"
+if [[ "$FREE_NODES" -lt "$DC_SIZE" ]]; then
+  warn "Only ${FREE_NODES} free node(s) but DC size is ${DC_SIZE} -- some pods will stay Pending."
+  warn "Add workers first: sudo bash scripts/k8s-k8ssandra-setup.sh --role add-workers --workers IP1,IP2 --ssh-key KEY"
+fi
+
+# ── Inherit storage class / heap from the first DC (or cluster-level settings) ──
+if [[ -z "$STORAGE_CLASS" ]]; then
+  STORAGE_CLASS=$(kubectl get k8ssandracluster "${CLUSTER_NAME}" -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.cassandra.datacenters[0].storageConfig.cassandraDataVolumeClaimSpec.storageClassName}')
+  if [[ -z "$STORAGE_CLASS" ]]; then
+    STORAGE_CLASS=$(kubectl get k8ssandracluster "${CLUSTER_NAME}" -n "${NAMESPACE}" \
+      -o jsonpath='{.spec.cassandra.storageConfig.cassandraDataVolumeClaimSpec.storageClassName}')
+  fi
+  STORAGE_CLASS=${STORAGE_CLASS:-local-path}
+fi
+kubectl get storageclass "$STORAGE_CLASS" > /dev/null 2>&1 || error "StorageClass '${STORAGE_CLASS}' not found."
+if [[ -z "$HEAP_SIZE" ]]; then
+  HEAP_SIZE=$(kubectl get k8ssandracluster "${CLUSTER_NAME}" -n "${NAMESPACE}" \
+    -o jsonpath='{.spec.cassandra.datacenters[0].config.jvmOptions.heapSize}')
+  HEAP_SIZE=${HEAP_SIZE:-2048M}
+fi
+info "Storage class: ${STORAGE_CLASS} | Heap: ${HEAP_SIZE}"
+
+# ── Replication annotation for user keyspaces (must be set BEFORE the DC is added) ──
+if [[ -n "$REPLICATION" ]]; then
+  EXISTING_ANN=$(kubectl get k8ssandracluster "${CLUSTER_NAME}" -n "${NAMESPACE}" \
+    -o jsonpath='{.metadata.annotations.k8ssandra\.io/dc-replication}')
+  NEW_ANN=$(python3 -c 'import json,sys; a=json.loads(sys.argv[1] or "{}"); a[sys.argv[2]]=json.loads(sys.argv[3]); print(json.dumps(a))' \
+    "$EXISTING_ANN" "$DC_NAME" "$REPLICATION")
+  kubectl annotate k8ssandracluster "${CLUSTER_NAME}" -n "${NAMESPACE}" --overwrite "k8ssandra.io/dc-replication=${NEW_ANN}" > /dev/null
+  success "Replication for user keyspaces in ${DC_NAME}: ${REPLICATION}"
+else
+  warn "No --replication given: your own keyspaces will NOT get replicas in ${DC_NAME}."
 fi
 
 # ── Retrieve current Cassandra server version from existing cluster ──
@@ -105,7 +166,7 @@ kubectl patch k8ssandracluster "${CLUSTER_NAME}" -n "${NAMESPACE}" \
         \"size\": ${DC_SIZE},
         \"storageConfig\": {
           \"cassandraDataVolumeClaimSpec\": {
-            \"storageClassName\": \"local-path\",
+            \"storageClassName\": \"${STORAGE_CLASS}\",
             \"accessModes\": [\"ReadWriteOnce\"],
             \"resources\": {
               \"requests\": {
@@ -116,7 +177,7 @@ kubectl patch k8ssandracluster "${CLUSTER_NAME}" -n "${NAMESPACE}" \
         },
         \"config\": {
           \"jvmOptions\": {
-            \"heapSize\": \"2048M\"
+            \"heapSize\": \"${HEAP_SIZE}\"
           }
         }
       }

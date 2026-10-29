@@ -1,20 +1,16 @@
----
-# ============================================================
-# local-path-provisioner.yaml
-# Dynamic local storage provisioner for Kubernetes on EC2
-# (No EBS CSI driver or IAM role required)
+# ==============================================================================
+# local-path-provisioner.yaml  (rancher/local-path-provisioner v0.0.37, upstream)
+# Dynamic local storage: PVs are directories under /opt/local-path-provisioner
+# on the node that runs the pod. No EBS CSI driver or IAM role needed.
 #
-# Usage:
-#   kubectl apply -f local-path-provisioner.yaml
+# Applied automatically by scripts/k8s-k8ssandra-setup.sh when
+# STORAGE_CLASS=local-path (the script substitutes LOCAL_PATH_VERSION and
+# LOCAL_PATH_DIR). Manual use:  kubectl apply -f manifests/local-path-provisioner.yaml
 #
-# This creates:
-#   - Namespace: local-path-storage
-#   - ServiceAccount, ClusterRole, ClusterRoleBinding
-#   - Deployment: local-path-provisioner
-#   - StorageClass: local-path (set as default)
-#   - ConfigMap: local-path-config (stores data at /opt/local-path-provisioner)
-# ============================================================
-
+# The StorageClass is intentionally NOT the cluster default; the Cassandra
+# manifest names it explicitly, so it never clashes with another default class.
+# Changes vs upstream: header comments, helper image pinned to busybox:1.37.
+# ==============================================================================
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -29,22 +25,48 @@ metadata:
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: local-path-provisioner-role
+  namespace: local-path-storage
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: local-path-provisioner-role
 rules:
   - apiGroups: [""]
-    resources: ["nodes", "persistentvolumeclaims", "configmaps"]
+    resources: ["nodes", "persistentvolumeclaims", "configmaps", "pods", "pods/log"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
-    resources: ["endpoints", "persistentvolumes", "pods"]
-    verbs: ["*"]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: local-path-provisioner-bind
+  namespace: local-path-storage
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: local-path-provisioner-role
+subjects:
+  - kind: ServiceAccount
+    name: local-path-provisioner-service-account
+    namespace: local-path-storage
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -79,7 +101,7 @@ spec:
       serviceAccountName: local-path-provisioner-service-account
       containers:
         - name: local-path-provisioner
-          image: rancher/local-path-provisioner:v0.0.26
+          image: docker.io/rancher/local-path-provisioner:v0.0.37
           imagePullPolicy: IfNotPresent
           command:
             - local-path-provisioner
@@ -87,6 +109,29 @@ spec:
             - start
             - --config
             - /etc/config/config.json
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
           volumeMounts:
             - name: config-volume
               mountPath: /etc/config/
@@ -95,23 +140,23 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: CONFIG_MOUNT_PATH
+              value: /etc/config/
+            - name: HEALTH_PORT
+              value: "8080"
       volumes:
         - name: config-volume
           configMap:
             name: local-path-config
-            namespace: local-path-storage
 
 ---
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: local-path
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
 provisioner: rancher.io/local-path
 volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Delete
-allowVolumeExpansion: true
 
 ---
 kind: ConfigMap
@@ -122,12 +167,12 @@ metadata:
 data:
   config.json: |-
     {
-      "nodePathMap": [
-        {
-          "node": "DEFAULT_PATH_FOR_NON_LISTED_NODES",
-          "paths": ["/opt/local-path-provisioner"]
-        }
-      ]
+            "nodePathMap":[
+            {
+                    "node":"DEFAULT_PATH_FOR_NON_LISTED_NODES",
+                    "paths":["/opt/local-path-provisioner"]
+            }
+            ]
     }
   setup: |-
     #!/bin/sh
@@ -143,7 +188,12 @@ data:
     metadata:
       name: helper-pod
     spec:
+      priorityClassName: system-node-critical
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
       containers:
-        - name: helper-pod
-          image: busybox
-          imagePullPolicy: IfNotPresent
+      - name: helper-pod
+        image: docker.io/library/busybox:1.37
+        imagePullPolicy: IfNotPresent

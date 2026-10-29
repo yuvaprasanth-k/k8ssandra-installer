@@ -149,7 +149,7 @@ allowVolumeExpansion: true
 parameters:
   type: gp2
   fsType: ext4
-  encrypted: "false"
+  encrypted: "true"
 EOF
 
 success "gp2 StorageClass created and set as default."
@@ -169,7 +169,7 @@ allowVolumeExpansion: true
 parameters:
   type: gp3
   fsType: ext4
-  encrypted: "false"
+  encrypted: "true"
   throughput: "125"
   iops: "3000"
 EOF
