@@ -1,290 +1,247 @@
-# k8ssandra-on-ec2
+# K8ssandra Installer
 
-Deploy **Apache Cassandra** on **AWS EC2** (or any Linux VMs) with **Kubernetes** and the **K8ssandra Operator**, using **one command**. Or install only K8ssandra on a Kubernetes cluster you already have.
-
----
-
-## What gets installed
-
-| Component | Default version | Configurable with |
-|---|---|---|
-| Kubernetes (kubeadm, kubelet, kubectl) | 1.36 | `--k8s-version` |
-| containerd | OS / Docker repo | — |
-| CNI: Calico (VXLAN overlay) | v3.33.0 | `--cni`, `--calico-version`, `--calico-encap`, `--cni-manifest` |
-| Storage: local-path-provisioner, or EBS CSI with encrypted gp3, or your own class | v0.0.37 | `--storage-class`, `--storage-size` |
-| Helm (only if missing) | v3.22.1 | `--helm-version` |
-| cert-manager (skipped if already present) | v1.21.3 | `--cert-manager-version` |
-| K8ssandra Operator (Helm chart) | 1.33.0 | `--operator-version` |
-| Apache Cassandra | 4.1.8 (5.0.x supported) | `--cassandra-version`, `--cassandra-image` |
-| Addons: Prometheus + Grafana, Reaper, Medusa | — | `--addons monitoring,reaper,medusa` |
+Automated installer for **Kubernetes** and **Apache Cassandra** via the **K8ssandra Operator** on AWS EC2, bare-metal / Linux VMs, or existing Kubernetes clusters.
 
 ---
 
-## Repository structure
+## Overview
 
-```
-k8ssandra-on-ec2/
+This repository provides single-command automation for:
+- Provisioning a multi-node **Kubernetes (kubeadm)** cluster across EC2 instances or Linux VMs.
+- Setting up CNI networking (**Calico** VXLAN overlay), dynamic local storage (**local-path-provisioner**) or AWS EBS gp3, and **cert-manager**.
+- Deploying the **K8ssandra Operator** and orchestrating an **Apache Cassandra** (4.1.x / 5.0.x) cluster with anti-affinity across nodes or availability zones.
+- Optional Day-2 addons: **Prometheus & Grafana** metrics dashboards, **Reaper** automated repairs, and **Medusa** backup/restore (using AWS S3, S3-compatible storage, or in-cluster **SeaweedFS**).
+
+---
+
+## Components & Versions
+
+| Component | Default Version | Configurable Parameter | Purpose |
+|---|---|---|---|
+| **Kubernetes** | `1.36` | `--k8s-version` | Container orchestration (`kubeadm`, `kubelet`, `kubectl`) |
+| **containerd** | OS / Docker repo | — | Container runtime engine |
+| **CNI (Calico)** | `v3.33.0` | `--cni`, `--calico-version`, `--calico-encap` | Inter-node pod networking (VXLAN / IPIP) |
+| **Storage Provisioner** | `v0.0.37` | `--storage-class`, `--storage-size` | `local-path` dynamic storage or AWS `ebs-gp3` |
+| **cert-manager** | `v1.21.3` | `--cert-manager-version` | TLS certificates for operator webhooks |
+| **K8ssandra Operator** | `1.33.0` | `--operator-version` | Lifecycle management for Cassandra clusters |
+| **Apache Cassandra** | `4.1.8` | `--cassandra-version`, `--cassandra-image` | Distributed NoSQL database (5.0.x supported) |
+| **Helm** | `v3.22.1` | `--helm-version` | Package manager (installed if missing) |
+| **Addons** | Latest stable | `--addons monitoring,reaper,medusa` | Monitoring, scheduled repairs, and backups |
+
+---
+
+## Repository Structure
+
+```text
+k8ssandra-installer/
 ├── scripts/
-│   ├── k8s-k8ssandra-setup.sh       # Main installer — all roles, fully automated
-│   ├── k8ssandra-addons-setup.sh    # Monitoring, Reaper, Medusa (called by setup via --addons)
-│   ├── k8ssandra-backup-setup.sh    # SeaweedFS (in-cluster S3) + Medusa, S3-compatible storage, test backup
-│   ├── k8ssandra-add-dc.sh          # Add a Cassandra datacenter (with keyspace replication)
-│   ├── k8ssandra-cleanup.sh         # Remove K8ssandra, or tear down every node
-│   └── fix-pvc-ebs.sh               # Legacy EBS helper (prefer --storage-class ebs-gp3)
+│   ├── k8s-k8ssandra-setup.sh       # Main installer supporting all roles and full automation
+│   ├── k8ssandra-addons-setup.sh    # Monitoring (Prometheus/Grafana) and Reaper setup
+│   ├── k8ssandra-backup-setup.sh    # SeaweedFS (in-cluster S3) & Medusa backup automation
+│   ├── k8ssandra-add-dc.sh          # Helper to add new Cassandra datacenters with keyspace replication
+│   └── k8ssandra-cleanup.sh         # Scoped cleanup (addons/K8ssandra only) or full cluster reset
 ├── manifests/
-│   ├── local-path-provisioner.yaml  # Applied by the setup script for local-path storage
-│   └── cassandra-cluster.yaml       # Example spec for --cluster-manifest
+│   ├── local-path-provisioner.yaml  # Dynamic local storage provisioner manifest
+│   └── cassandra-cluster.yaml       # Sample standalone K8ssandraCluster specification
 ├── config/
-│   ├── cluster.env.example          # Every setting, documented — copy to cluster.env
-│   └── kube-prom-stack-values.yaml
-└── docs/k8ssandra-runbook.md
+│   ├── cluster.env.example          # Environment configuration template
+│   └── kube-prom-stack-values.yaml  # Prometheus and Grafana Helm values
+└── docs/
+    ├── k8ssandra-runbook.md         # Operational and Day-2 administration runbook
+    └── k8ssandra-on-ec2.txt         # Architecture, prerequisites, and backup notes
 ```
 
 ---
 
-## Quick start: everything with one command
+## Prerequisites
 
-### Prerequisites
-- 1 control-plane instance plus N workers. Run at least as many workers as `DC_SIZE` (default 3), because each Cassandra pod needs its own node. Use `m5.xlarge` or larger for real workloads; `t3.large` is fine for a lab.
-- Amazon Linux 2023, Ubuntu 22.04/24.04, Debian or a RHEL-family OS. Same VPC, private IPs reachable from each other.
-- **The control plane can SSH to every worker** with a key, and the SSH user has passwordless `sudo` (the default for `ec2-user` and `ubuntu`). Copy the key onto the control plane, e.g. `/home/ec2-user/.ssh/cluster-key.pem` with `chmod 600`.
-- Security group: see [ports](#security-group-ports).
+1. **Instances / Virtual Machines**:
+   - **Control Plane**: 1 node (minimum 2 vCPU, 4 GB RAM, 30 GB disk — e.g., `t3.medium`).
+   - **Worker Nodes**: 1 node per Cassandra replica (`DC_SIZE`, default 3 nodes, minimum `t3.large`, recommended `m5.xlarge`+ for production, 50 GB+ disk).
+   - **Operating System**: Ubuntu 24.04 LTS (recommended), Ubuntu 22.04 LTS, Amazon Linux 2023, or RHEL-compatible.
+2. **Network & Connectivity**:
+   - All nodes must reside in the same VPC/subnet with private IPs reachable from each other.
+   - **SSH Access**: Control-plane node must be able to SSH to all worker nodes via key with passwordless `sudo` privileges.
+3. **Security Group Ports**:
+   - **Between cluster nodes**: TCP `6443` (API), TCP `2379-2380` (etcd), TCP `10250` (kubelet), UDP `4789` (Calico VXLAN), TCP `7000-7001` (Cassandra inter-node), TCP `9042` (CQL), TCP `22` (SSH).
+   - **Inbound access (admin IP / VPN only)**: TCP `22` (SSH), TCP `6443` (Kubernetes API), TCP `32000` (Grafana), TCP `32080` (Reaper UI).
 
-### 1. Copy the repo to the control-plane node and configure it
+---
+
+## Quick Start (One-Command Deployment)
+
+### Step 1: Copy or Clone Repository to Control-Plane Node
+Copy this repository onto your designated control-plane node.
+
+### Step 2: Configure Environment Settings
+Copy the template and edit your worker private IPs and SSH credentials:
+
 ```bash
 cp config/cluster.env.example config/cluster.env
-vi config/cluster.env        # at minimum: WORKERS, SSH_USER, SSH_KEY
+vi config/cluster.env
 ```
 
-### 2. Run it
+At minimum, set:
+```ini
+WORKERS="10.0.1.11,10.0.1.12,10.0.1.13"
+SSH_USER=ec2-user
+SSH_KEY=/home/ec2-user/.ssh/cluster-key.pem
+```
+
+### Step 3: Run the Automated Installer
+Execute the setup script from the control-plane node:
+
 ```bash
 sudo bash scripts/k8s-k8ssandra-setup.sh --role all --config config/cluster.env
 ```
 
-Or with flags only:
+*Or pass configuration directly via CLI flags:*
 ```bash
 sudo bash scripts/k8s-k8ssandra-setup.sh --role all \
   --workers 10.0.1.11,10.0.1.12,10.0.1.13 \
-  --ssh-user ec2-user --ssh-key /home/ec2-user/.ssh/cluster-key.pem
+  --ssh-user ec2-user \
+  --ssh-key /home/ec2-user/.ssh/cluster-key.pem \
+  --dc-size 3
 ```
-
-What happens, in order:
-
-| Step | Action |
-|---|---|
-| 0 | Validates all settings and checks SSH + sudo on every worker **before touching anything** |
-| 1 | Prepares the control plane (swap, kernel, containerd, kubeadm, kubelet with node IP and AZ labels) |
-| 2 | `kubeadm init`, then Calico with your pod CIDR (checked against the VPC CIDR) |
-| 3 | Copies the script to every worker over SSH and joins them **in parallel**, with one log per worker in `/var/log/` |
-| 4 | Waits until every worker is Ready |
-| 5 | Storage → cert-manager → K8ssandra Operator (retries while webhooks warm up) |
-| 6 | Generates and applies the K8ssandraCluster, saving it to `/root/k8ssandra-<cluster>.yaml` |
-| 7 | Waits for the Cassandra datacenter to be **Ready** |
-| 8 | Installs the addons, if you asked for any |
-
-**Safe to re-run:** finished steps are detected and skipped, including an initialised control plane, workers that already joined, and installed Helm releases.
-The whole run is logged to `/var/log/k8ssandra-setup.log`.
 
 ---
 
-## Customising
+## Deployment Roles
 
-Every option works as a **flag**, a **config-file line** or an **environment variable**, in that order of priority.
-`bash scripts/k8s-k8ssandra-setup.sh --help` lists them all, and `config/cluster.env.example` documents each one.
+The installer supports multiple execution roles via `--role <role>`:
 
+| Role | Target Node | Description |
+|---|---|---|
+| `all` | Control Plane | Prepares control plane, initializes Kubernetes, joins workers over SSH, installs storage, cert-manager, K8ssandra Operator, Cassandra cluster, and addons. |
+| `control-plane` | Control Plane | Sets up Kubernetes and CNI only; optionally joins workers if `--workers` is supplied. Does not deploy K8ssandra. |
+| `add-workers` | Control Plane | Joins additional worker nodes to an active cluster over SSH. |
+| `worker` | Worker Node | Manually joins the local node using `--join-command "kubeadm join ..."`. |
+| `k8ssandra` | Any node with `kubectl` | Deploys K8ssandra Operator and Cassandra cluster to an existing Kubernetes/EKS cluster. |
+
+### Examples
+
+**Scale Cluster (Add Workers):**
 ```bash
-# See the effective settings without installing anything
-bash scripts/k8s-k8ssandra-setup.sh --config config/cluster.env --print-config
-
-# Preview the K8ssandraCluster YAML that would be applied
-bash scripts/k8s-k8ssandra-setup.sh --config config/cluster.env --render-only
+sudo bash scripts/k8s-k8ssandra-setup.sh --role add-workers \
+  --workers 10.0.1.14,10.0.1.15 \
+  --ssh-user ec2-user \
+  --ssh-key /home/ec2-user/.ssh/cluster-key.pem
 ```
 
-Common recipes:
-
-```bash
-# Production-like: EBS gp3 (encrypted), one rack per AZ, sized pods, Cassandra 5.0, addons
-sudo bash scripts/k8s-k8ssandra-setup.sh --role all --config config/cluster.env \
-  --storage-class ebs-gp3 --storage-size 200Gi \
-  --racks zone --cpu 4 --memory 16Gi --heap-size 8G \
-  --cassandra-version 5.0.4 --dc-size 6 \
-  --addons monitoring,reaper,medusa
-
-# Different Kubernetes version / network ranges / overlay
-sudo bash scripts/k8s-k8ssandra-setup.sh --role all --config config/cluster.env \
-  --k8s-version 1.35 --pod-cidr 10.244.0.0/16 --calico-encap IPIP
-
-# Single-node lab (Cassandra on the control plane)
-sudo bash scripts/k8s-k8ssandra-setup.sh --role all \
-  --schedule-on-control-plane --dc-size 1 --heap-size 1G
-
-# Bring your own K8ssandraCluster spec
-sudo bash scripts/k8s-k8ssandra-setup.sh --role all --config config/cluster.env \
-  --cluster-manifest manifests/cassandra-cluster.yaml
-```
-
-Racks (`--racks zone`): on EC2, every node labels itself with `topology.kubernetes.io/zone`. The script creates one rack per AZ, so Cassandra spreads its replicas across AZs. You can also give an explicit list: `--racks us-east-1a,us-east-1b,us-east-1c`.
-
----
-
-## Install K8ssandra on an existing cluster
-
-Works on a kubeadm cluster, EKS, or any conformant Kubernetes. Root is not needed if Helm is already installed.
-
+**Deploy K8ssandra onto an Existing Kubernetes Cluster:**
 ```bash
 bash scripts/k8s-k8ssandra-setup.sh --role k8ssandra \
   --kubeconfig ~/.kube/config \
   --storage-class gp3 \
-  --dc-size 3 --cpu 2 --memory 8Gi
-```
-`--storage-class` takes an existing StorageClass name, or `local-path` / `ebs-gp3` to have the script install one.
-
-cert-manager is skipped automatically if it's already installed. Use `--skip-cluster` to install only the operator.
-
----
-
-## Step-by-step roles
-
-| Role | Run on | Does |
-|---|---|---|
-| `all` | control plane | Everything (above) |
-| `control-plane` | control plane | Kubernetes + CNI, plus joins `--workers` if given. No K8ssandra. |
-| `add-workers` | control plane | Joins more workers over SSH to a running cluster |
-| `worker` | a worker | Manual join: `--join-command "kubeadm join ..."` |
-| `k8ssandra` | anywhere with kubectl | K8ssandra stack and Cassandra on an existing cluster |
-
-```bash
-# Kubernetes first, K8ssandra later
-sudo bash scripts/k8s-k8ssandra-setup.sh --role control-plane --config config/cluster.env
-sudo bash scripts/k8s-k8ssandra-setup.sh --role k8ssandra   --config config/cluster.env
-
-# Grow the cluster
-sudo bash scripts/k8s-k8ssandra-setup.sh --role add-workers \
-  --workers 10.0.1.14,10.0.1.15,10.0.1.16 --ssh-key /home/ec2-user/.ssh/cluster-key.pem
+  --dc-size 3 \
+  --cpu 2 \
+  --memory 8Gi
 ```
 
 ---
 
-## Adding a datacenter
+## Day-2 Operations
 
-```bash
-# 1. Add nodes for it (each Cassandra pod needs its own node)
-sudo bash scripts/k8s-k8ssandra-setup.sh --role add-workers --workers IP4,IP5,IP6 --ssh-key KEY
+### 1. Accessing Services
 
-# 2. Add the DC, listing ALL your keyspaces with the replica count wanted in dc2
-sudo bash scripts/k8ssandra-add-dc.sh --dc-name dc2 --dc-size 3 \
-  --replication '{"orders": 3, "users": 3}'
-```
+- **Cassandra CQL**:
+  ```bash
+  # Retrieve superuser credentials
+  kubectl get secret cassandra-cluster-superuser -n k8ssandra-operator -o jsonpath='{.data.username}' | base64 -d; echo
+  kubectl get secret cassandra-cluster-superuser -n k8ssandra-operator -o jsonpath='{.data.password}' | base64 -d; echo
 
-The storage class and heap size are copied from `dc1` unless you pass `--storage-class` or `--heap-size`. Without `--replication`, only the system and K8ssandra keyspaces are replicated to the new DC.
+  # Connect to CQL shell
+  kubectl exec -it cassandra-cluster-dc1-default-sts-0 -n k8ssandra-operator -c cassandra -- cqlsh -u <username> -p <password>
+  ```
 
----
+- **Grafana Dashboard**:
+  - **URL**: `http://<node-ip>:32000`
+  - **Username**: `admin`
+  - **Password**:
+    ```bash
+    kubectl get secret prometheus-grafana -n k8ssandra-operator -o jsonpath='{.data.admin-password}' | base64 -d; echo
+    ```
 
-## Addons
+- **Reaper UI (Automated Repairs)**:
+  - **URL**: `http://<node-ip>:32080/webui`
+  - **Credentials**:
+    ```bash
+    kubectl get secret cassandra-cluster-reaper-ui -n k8ssandra-operator -o jsonpath='{.data.password}' | base64 -d; echo
+    ```
 
-`--addons monitoring,reaper,medusa` on the setup script, or run `scripts/k8ssandra-addons-setup.sh` on its own.
-Medusa secrets are read from the config file or environment, never from the command line:
+### 2. Backups & Restores (`scripts/k8ssandra-backup-setup.sh`)
 
-```bash
-# config/cluster.env
-ADDONS=monitoring,reaper,medusa
-MEDUSA_BUCKET=my-cassandra-backups
-MEDUSA_REGION=us-east-1
-MEDUSA_CREDENTIALS_TYPE=role-based     # use the instances' IAM role — no keys
-# or: MEDUSA_CREDENTIALS_TYPE=credential-based + MEDUSA_ACCESS_KEY / MEDUSA_SECRET_KEY (chmod 600 the file)
-```
+- **In-Cluster SeaweedFS (Local S3 Storage)**:
+  ```bash
+  sudo bash scripts/k8ssandra-backup-setup.sh --seaweedfs --medusa --test-backup
+  ```
 
-### Backups: `scripts/k8ssandra-backup-setup.sh`
+- **AWS S3 / S3-Compatible Remote Storage**:
+  ```bash
+  export MEDUSA_ACCESS_KEY="<ACCESS_KEY>"
+  export MEDUSA_SECRET_KEY="<SECRET_KEY>"
 
-Medusa and its storage have their own script; `k8ssandra-addons-setup.sh` stays as it is.
+  sudo -E bash scripts/k8ssandra-backup-setup.sh --medusa \
+    --medusa-bucket cassandra-backups \
+    --medusa-region us-east-1
+  ```
 
-In-cluster storage with SeaweedFS (no AWS account needed). Installs SeaweedFS, creates the bucket, and points Medusa at it:
+- **Trigger an Ad-hoc Backup**:
+  ```bash
+  kubectl apply -n k8ssandra-operator -f - <<EOF
+  apiVersion: medusa.k8ssandra.io/v1alpha1
+  kind: MedusaBackupJob
+  metadata:
+    name: backup-$(date +%Y%m%d-%H%M)
+  spec:
+    cassandraDatacenter: dc1
+  EOF
+  ```
 
-```bash
-sudo bash scripts/k8ssandra-backup-setup.sh --seaweedfs --medusa --test-backup
-#   options (env): MEDUSA_BUCKET=cassandra-backups  SEAWEEDFS_STORAGE_CLASS=local-path  SEAWEEDFS_SIZE=50Gi
-```
-SeaweedFS runs as a single pod with its data on one PVC. That's fine for labs and small clusters; for production use AWS S3 or Ceph (Rook).
+### 3. Adding a Cassandra Datacenter (`scripts/k8ssandra-add-dc.sh`)
 
-S3-compatible storage (MinIO, Wasabi, Ceph RGW, ...) — keys are required, IAM roles only work with AWS S3:
-
-```bash
-export MEDUSA_ACCESS_KEY=... MEDUSA_SECRET_KEY=...
-sudo -E bash scripts/k8ssandra-backup-setup.sh --medusa \
-  --medusa-provider s3_compatible --medusa-bucket cassandra-backups \
-  --medusa-host minio.example.com --medusa-port 9000 --medusa-secure false
-#   HTTPS endpoint with a self-signed cert:  --medusa-port 443 --medusa-secure true --medusa-ssl-verify false
-#   Ceph RADOS Gateway:                       --medusa-provider s3_rgw
-```
-The script checks that the endpoint is reachable from inside the cluster before enabling Medusa. The bucket must already exist.
-
-| Service | Access |
-|---|---|
-| Grafana | `http://<node-ip>:32000`, user `admin`, password: `kubectl -n k8ssandra-operator get secret prometheus-grafana -o jsonpath='{.data.admin-password}' \| base64 -d` |
-| Reaper UI | `http://<node-ip>:32080/webui` |
-| CQL | `kubectl -n k8ssandra-operator exec -it <pod> -c cassandra -- cqlsh -u <user> -p <pw>` |
-
-```bash
-# Cassandra superuser
-kubectl -n k8ssandra-operator get secret cassandra-cluster-superuser -o jsonpath='{.data.username}' | base64 -d
-kubectl -n k8ssandra-operator get secret cassandra-cluster-superuser -o jsonpath='{.data.password}' | base64 -d
-```
-
----
-
-## Security group ports
-
-Between cluster nodes (source: the cluster's own security group):
-
-| Port | Protocol | Purpose |
-|---|---|---|
-| `6443` | TCP | Kubernetes API |
-| `2379-2380` | TCP | etcd |
-| `10250` | TCP | kubelet |
-| `4789` | UDP | Calico VXLAN (default `--calico-encap VXLAN`) |
-| IP protocol `4` + `179`/TCP | — | **Only** with `--calico-encap IPIP` (IP-in-IP + BGP) |
-| `7000-7001`, `9042` | TCP | Cassandra inter-node / CQL |
-| `22` | TCP | SSH from control plane → workers (auto-join, full teardown) |
-
-From your own IP or VPN only, **never `0.0.0.0/0`**: `22`, `6443`, and any NodePorts you use (`32000` Grafana, `32080` Reaper).
+1. Add sufficient worker nodes first using `--role add-workers`.
+2. Deploy the new datacenter and update keyspace replication:
+   ```bash
+   sudo bash scripts/k8ssandra-add-dc.sh --dc-name dc2 --dc-size 3 \
+     --replication '{"my_keyspace": 3}'
+   ```
 
 ---
 
-## Storage
+## Cleanup & Teardown
 
-| `--storage-class` | Use for | Notes |
-|---|---|---|
-| `local-path` (default) | labs, dev | Data lives in `/opt/local-path-provisioner` on the node; losing the node loses that replica |
-| `ebs-gp3` | production on EC2 | Installs the EBS CSI driver and an **encrypted** gp3 class with `Retain`. Nodes need an IAM role with `AmazonEBSCSIDriverPolicy` and IMDS hop limit ≥ 2 |
-| any other name | existing clusters | Must already exist |
+- **Remove K8ssandra & Addons (Preserve Kubernetes cluster)**:
+  ```bash
+  sudo bash scripts/k8ssandra-cleanup.sh --scope k8ssandra
+  ```
 
-> A datacenter's storage class can't be changed after it's created. To move from local-path to EBS, add a new DC on `ebs-gp3` and decommission the old one.
+- **Remove Specific Components**:
+  ```bash
+  sudo bash scripts/k8ssandra-cleanup.sh --scope monitoring
+  sudo bash scripts/k8ssandra-cleanup.sh --scope medusa,seaweedfs
+  ```
 
----
-
-## Cleanup
-
-```bash
-sudo bash scripts/k8ssandra-cleanup.sh --scope k8ssandra          # K8ssandra only, keep Kubernetes
-# Every node (asks you to type 'destroy')
-sudo bash scripts/k8ssandra-cleanup.sh --scope full \
-  --ssh-user ec2-user --ssh-key /home/ec2-user/.ssh/cluster-key.pem
-```
-
-With `ebs-gp3` (reclaim policy `Retain`), EBS volumes survive cleanup. Delete them in the EC2 console when you no longer need the data.
+- **Full Cluster Teardown (Resets all nodes and Kubernetes)**:
+  ```bash
+  sudo bash scripts/k8ssandra-cleanup.sh --scope full --config config/cluster.env
+  ```
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Check |
+| Symptom | Diagnostic Command / Action |
 |---|---|
-| Worker join failed | `/var/log/k8ssandra-setup-worker-<ip>.log` on the control plane |
-| Nodes `NotReady` | `kubectl -n kube-system get pods -o wide` (Calico), plus security group UDP 4789 |
-| Cassandra pods `Pending` | `kubectl describe pod`: too few free nodes (one per pod) or unbound PVC |
-| DC never Ready | `kubectl -n k8ssandra-operator describe cassandradatacenter dc1` |
+| **Worker node join fails** | Check logs: `/var/log/k8ssandra-setup-worker-<ip>.log` on control plane. Verify SSH connectivity and security group port `6443`. |
+| **Nodes in `NotReady` status** | Inspect Calico daemonset: `kubectl -n kube-system get pods -l k8s-app=calico-node`. Verify UDP port `4789` is open. |
+| **Cassandra pods `Pending`** | Run `kubectl describe pod <pod-name> -n k8ssandra-operator`. Ensure each pod has a dedicated worker node (anti-affinity). |
+| **Storage PVC Unbound** | Check storage class: `kubectl get sc,pvc -n k8ssandra-operator` and verify `local-path-provisioner` pods are running in `local-path-storage`. |
 
-See [`docs/k8ssandra-runbook.md`](docs/k8ssandra-runbook.md) for day-2 operations.
+For in-depth operational procedures, consult [`docs/k8ssandra-runbook.md`](docs/k8ssandra-runbook.md).
+
+---
 
 ## License
-Apache 2.0
+
+Apache License 2.0
