@@ -74,11 +74,21 @@ k8ssandra-installer/
 Launch a 4-node cluster (1 control plane + 3 workers) on Ubuntu 24.04 (noble):
 
 ```bash
-ctool launch $cluster -p noble -i t3.large 4
+ctool launch <clustername> -p noble -i t3.large 4
 ```
 
-### Step 2: Copy or Clone Repository to Control-Plane Node
-Copy this repository onto your designated control-plane node (Node 1).
+### Step 2: Copy Repository to Control-Plane Node
+Copy the repository archive to the control-plane node (Node 0) and connect:
+
+```bash
+# Copy repo to Node 0
+ctool scp <clustername> 0 <repo.zip> /tmp/
+
+# SSH into Node 0 and extract
+ctool ssh <clustername> 0
+unzip /tmp/<repo.zip> -d ~/k8ssandra-installer
+cd ~/k8ssandra-installer
+```
 
 ### Step 3: Configure Environment Settings
 Copy the template and edit your worker private IPs and SSH credentials:
