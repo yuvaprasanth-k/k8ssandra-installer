@@ -197,17 +197,7 @@ Deploys SeaweedFS S3-compatible object store on local storage, creates the backu
 sudo bash scripts/k8ssandra-backup-setup.sh --seaweedfs --medusa --test-backup
 ```
 
-#### Option B: AWS S3 Backup (IAM Role / No Keys)
-Uses EC2 IAM Instance Profile / EKS IRSA credentials:
-
-```bash
-sudo bash scripts/k8ssandra-backup-setup.sh --medusa \
-  --medusa-bucket my-cassandra-backups \
-  --medusa-region us-east-1 \
-  --medusa-credentials-type role-based
-```
-
-#### Option C: AWS S3 or S3-Compatible Remote Storage (MinIO, Wasabi, Ceph RGW)
+#### Option B: AWS S3 or S3-Compatible Remote Storage (MinIO, Wasabi, Ceph RGW)
 Pass credentials safely via environment variables:
 
 ```bash
